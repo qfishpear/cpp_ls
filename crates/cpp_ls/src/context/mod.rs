@@ -3,7 +3,10 @@ mod client;
 mod client_id;
 mod diagnostics;
 mod lsp_features;
+#[cfg(not(target_arch = "wasm32"))]
 mod native_watcher;
+#[cfg(target_arch = "wasm32")]
+mod native_watcher_stub;
 mod query_runner;
 mod snapshot;
 mod status_bar;
@@ -17,7 +20,10 @@ pub use diagnostics::DiagnosticService;
 pub use lsp_features::LspFeatures;
 use lsp_server::{Connection, ErrorCode, RequestId, Response};
 use lsp_types::ClientCapabilities;
+#[cfg(not(target_arch = "wasm32"))]
 pub use native_watcher::NativeFileWatcher;
+#[cfg(target_arch = "wasm32")]
+pub use native_watcher_stub::NativeFileWatcher;
 pub use query_runner::{CancelSource, RequestOutcome, snapshot_query};
 pub use snapshot::ServerContextSnapshot;
 pub use status_bar::ProgressTask;

@@ -1,8 +1,20 @@
 use clap::Parser;
 use cpp_ls::cmd_args::CmdArgs;
-use mimalloc_safe::MiMalloc;
 use std::alloc::{GlobalAlloc, Layout};
 use std::error::Error;
+
+#[cfg(not(target_arch = "wasm32"))]
+use mimalloc_safe::MiMalloc;
+
+#[cfg(not(target_arch = "wasm32"))]
+type InnerAlloc = MiMalloc;
+#[cfg(target_arch = "wasm32")]
+type InnerAlloc = std::alloc::System;
+
+#[cfg(not(target_arch = "wasm32"))]
+const INNER: InnerAlloc = MiMalloc;
+#[cfg(target_arch = "wasm32")]
+const INNER: InnerAlloc = std::alloc::System;
 
 /// **mimalloc, plus a byte counter the pump can read** — see `cpp_ls::note_allocation` and `CPPLS_TRACE_ALLOCS`.
 /// The counting is off unless that variable is set, and the check is one relaxed load.
@@ -15,22 +27,22 @@ struct Counting;
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         cpp_ls::note_allocation(layout.size());
-        unsafe { MiMalloc.alloc(layout) }
+        unsafe { INNER.alloc(layout) }
     }
 
     unsafe fn dealloc(&self, pointer: *mut u8, layout: Layout) {
         cpp_ls::note_release(layout.size());
-        unsafe { MiMalloc.dealloc(pointer, layout) }
+        unsafe { INNER.dealloc(pointer, layout) }
     }
 
     unsafe fn realloc(&self, pointer: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
         cpp_ls::note_reallocation(layout.size(), new_size);
-        unsafe { MiMalloc.realloc(pointer, layout, new_size) }
+        unsafe { INNER.realloc(pointer, layout, new_size) }
     }
 
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
         cpp_ls::note_allocation(layout.size());
-        unsafe { MiMalloc.alloc_zeroed(layout) }
+        unsafe { INNER.alloc_zeroed(layout) }
     }
 }
 
@@ -45,8 +57,13 @@ fn main() -> Result<(), Box<dyn Error + Sync + Send>> {
     // — a second of work after the client has already been told the server is shutting down. `shutdown_timeout` waits
     // for at most that long and then lets the process end. Measured before this: `shutdown` with the client holding
     // stdin open left the process alive, and the goodbye line showed the hang was not in the server's own code.
+    #[cfg(not(target_arch = "wasm32"))]
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
+        .build()?;
+    #[cfg(target_arch = "wasm32")]
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
         .build()?;
     let result = runtime.block_on(cpp_ls::run_ls(cmd_args));
     runtime.shutdown_timeout(std::time::Duration::from_millis(250));

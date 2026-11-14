@@ -5,3 +5,13 @@
 
 [alias]
 t = "test --release"
+
+[target.wasm32-wasip1-threads]
+rustflags = [
+  "-C", "target-feature=+atomics,+bulk-memory,+mutable-globals",
+  "-C", "link-arg=--shared-memory",
+  "-C", "link-arg=--max-memory=536870912",
+  "-C", "link-arg=--import-memory",
+  "-C", "link-arg=--export-memory",
+  "-C", "link-arg=--export=wasi_thread_start",
+]

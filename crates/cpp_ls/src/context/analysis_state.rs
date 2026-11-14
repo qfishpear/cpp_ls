@@ -371,7 +371,7 @@ impl AnalysisState {
         let Some((Some(materials), guard)) = gathered else {
             return false;
         };
-        let prepared = tokio::task::spawn_blocking(move || (materials.read(), guard)).await;
+        let prepared = offload(move || (materials.read(), guard)).await;
         let (prepared, _guard) = match prepared {
             Ok(prepared) => prepared,
             Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
@@ -406,7 +406,7 @@ impl AnalysisState {
                 return Vec::new();
             }
         };
-        match tokio::task::spawn_blocking(move || {
+        match offload(move || {
             let _permit = permit;
             cooks.into_iter().filter_map(|cook| cook.render()).collect()
         })
@@ -474,7 +474,7 @@ impl AnalysisState {
         // the background's, and it must not be one of the permits a request waits for.
         let prepared = match materials {
             Some(materials) => {
-                match tokio::task::spawn_blocking(move || materials.read_the_program()).await {
+                match offload(move || materials.read_the_program()).await {
                     Ok(prepared) => prepared,
                     Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
                     Err(error) => {
@@ -607,7 +607,7 @@ impl AnalysisState {
         config_file: Option<PathBuf>,
     ) -> Option<Session<DiskFiles>> {
         let files = self.files.clone();
-        match tokio::task::spawn_blocking(move || {
+        match offload(move || {
             let session =
                 Session::open_with_config_file(root, files, filter, config_file.as_deref());
             let restored = session.load_the_sharing();
@@ -667,7 +667,7 @@ impl AnalysisState {
         let gate = self.gate.clone().read_owned().await;
         let waited_for_the_gate = started.elapsed().as_millis() as u64;
 
-        let result = tokio::task::spawn_blocking(move || {
+        let result = offload(move || {
             let _permit = permit;
             let locked = std::time::Instant::now();
             let session = inner
@@ -946,15 +946,35 @@ impl AnalysisState {
 /// Run `f` where blocking is allowed: on the server's multi-threaded runtime the thread hands its other tasks on
 /// (`block_in_place`), and anywhere else — a test's current-thread runtime — it is called directly, because
 /// `block_in_place` panics there.
+/// `spawn_blocking` on wasm starts another WASI thread whose filesystem calls cannot reach the
+/// browser shim. The caller awaits immediately, so running the work here is the same sequence.
+#[cfg(not(target_arch = "wasm32"))]
+fn offload<F, R>(f: F) -> tokio::task::JoinHandle<R>
+where
+    F: FnOnce() -> R + Send + 'static,
+    R: Send + 'static,
+{
+    tokio::task::spawn_blocking(f)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn offload<F, R>(f: F) -> std::future::Ready<Result<R, tokio::task::JoinError>>
+where
+    F: FnOnce() -> R + Send + 'static,
+    R: Send + 'static,
+{
+    std::future::ready(Ok(f()))
+}
+
 fn blocking<R>(f: impl FnOnce() -> R) -> R {
+    #[cfg(not(target_arch = "wasm32"))]
     if tokio::runtime::Handle::try_current()
         .map(|handle| handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread)
         .unwrap_or(false)
     {
-        tokio::task::block_in_place(f)
-    } else {
-        f()
+        return tokio::task::block_in_place(f);
     }
+    f()
 }
 
 impl Default for AnalysisState {

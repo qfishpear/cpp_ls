@@ -1219,11 +1219,25 @@ fn normalise(path: &Path) -> String {
 }
 
 fn compress(bytes: &[u8]) -> Vec<u8> {
-    zstd::encode_all(bytes, 3).unwrap_or_else(|_| bytes.to_vec())
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        zstd::encode_all(bytes, 3).unwrap_or_else(|_| bytes.to_vec())
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        bytes.to_vec()
+    }
 }
 
 fn decompress(bytes: &[u8]) -> Result<Vec<u8>> {
-    zstd::decode_all(bytes).map_err(|_| CacheError::Corrupt("zstd frame"))
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        zstd::decode_all(bytes).map_err(|_| CacheError::Corrupt("zstd frame"))
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        Ok(bytes.to_vec())
+    }
 }
 
 #[cfg(test)]

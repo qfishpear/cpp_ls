@@ -40,7 +40,7 @@ impl NativeFileWatcher {
         context: ServerContextSnapshot,
         root: PathBuf,
         filter: WatchFilter,
-    ) -> notify::Result<()> {
+    ) -> Result<(), String> {
         let mut current = self.state.lock().await;
         if let Some(state) = current.as_ref()
             && state.root == root
@@ -70,8 +70,11 @@ impl NativeFileWatcher {
                 }
                 callback_overflow.store(true, Ordering::Release);
             }
-        })?;
-        watcher.watch(&root, RecursiveMode::Recursive)?;
+        })
+        .map_err(|error| error.to_string())?;
+        watcher
+            .watch(&root, RecursiveMode::Recursive)
+            .map_err(|error| error.to_string())?;
 
         let task = tokio::spawn(watch_events(context, receiver, overflow, filter.clone()));
         let previous = current.replace(WatcherState {

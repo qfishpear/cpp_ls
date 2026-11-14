@@ -25,8 +25,8 @@ serde.workspace = true
 serde_json.workspace = true
 
 # The runtime. `tokio` because every handler is async, the update queue is a task and the indexing pump is another;
-# `tokio-util` for the `CancellationToken` every request carries.
-tokio.workspace = true
+# `tokio-util` for the `CancellationToken` every request carries. Features are target-specific below: the wasm
+# build has no threads, processes or sockets.
 tokio-util.workspace = true
 
 # The two vocabularies a reader hovers over -- C++'s keywords and Doxygen's commands -- are text, not logic: they
@@ -37,7 +37,7 @@ rust-i18n.workspace = true
 # A `file:` URI is percent-encoded, and a Windows path is not.
 percent-encoding.workspace = true
 # Native watching is used when the client cannot register watched-file notifications.
-notify.workspace = true
+# wasm has no inotify; the browser client pushes changes itself.
 
 # Logging: `log` for the calls, `fern` for the sink, `chrono` for the timestamp in the file name.
 log.workspace = true
@@ -45,11 +45,19 @@ fern.workspace = true
 chrono.workspace = true
 
 clap = { workspace = true, optional = true }
+
 # **`mimalloc-safe` in place of `mimalloc`.** The wrapper is the same `MiMalloc` type with the same `GlobalAlloc`
 # implementation, so nothing that uses it changes; what differs is who maintains it — `mimalloc-safe` ships 0.1.70 on
 # `libmimalloc-sys2`, while `mimalloc`'s last release is 0.1.52. The byte counter the pump reads is
-# `cpp_ls/src/bin/cpp_ls.rs`, which is the only reason this crate is a dependency at all.
+# `cpp_ls/src/bin/cpp_ls.rs`, which is the only reason this crate is a dependency at all. wasm has no mimalloc; that
+# build uses the system allocator.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time", "io-util", "net", "process", "signal", "fs"] }
+notify.workspace = true
 mimalloc-safe = { version = "0.1.70", optional = true }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+tokio = { workspace = true, features = ["macros", "rt", "sync", "time", "io-util"] }
 
 [[bin]]
 name = "cpp_ls"
