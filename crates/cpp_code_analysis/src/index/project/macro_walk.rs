@@ -3140,14 +3140,28 @@ impl ProjectIndex {
             })
     }
 
+    /// **Does this spelling name a type at all?** — a class, or a `typedef` / `using` alias of one.
+    ///
+    /// Looser than [`Self::scope_names_a_class`] on purpose. That one demands the qualified name match, so a
+    /// nested class called `Name` is not treated as the scope `Name`. A member question is the opposite: `ios` in
+    /// `ios::sync_with_stdio` is `typedef basic_ios<char> ios` inside `std`, and its qualified name is `std::ios`,
+    /// which the exact comparison rejects. The alias has no members of its own; [`members_of`] follows it.
+    pub(crate) fn names_a_type(&self, name: &str, visible_from: &Path) -> bool {
+        self.files_declaring(name, visible_from)
+            .iter()
+            .any(|declaration| declaration.fact.kind == DeclKind::Type)
+    }
+
     /// **What kind of thing a name is, when every declaration the index holds for it agrees** — and
     /// [`UnknownReason::Ambiguous`] when they do not.
     ///
     /// The question a semantic highlighter asks about a name it cannot resolve to one declaration: it has to draw a
     /// colour, and a colour is a claim about the *kind*. An overload set is one kind (`pick(int)` and `pick(double)`
-    /// are both functions, and a reader who sees both drawn as functions has been told the truth about both), while
-    /// `size` as a member of one class and a free function somewhere else is genuinely two answers, and a client
-    /// shown either one of them has been told something false about the other.
+    /// are both functions, and a reader who sees both drawn as functions has been told the truth about both). A
+    /// function template in a namespace and a member function of the same spelling are also one kind for this
+    /// question: both are functions, and the colour does not claim which overload was called. A class and a function
+    /// that share a spelling are genuinely two answers, and a client shown either one of them has been told something
+    /// false about the other.
     ///
     /// This is not [`ProjectIndex::definition`] with a looser rule — it is the same candidate set, read for the two
     /// fields a highlighter needs instead of cloned whole into an answer a jump would use. See
@@ -3158,9 +3172,9 @@ impl ProjectIndex {
             Err(reason) => return Known::Unknown(reason),
         };
 
-        // **A member's declaration cannot be what a bare spelling means.** `class TextRange { TextRange(); … }` files
-        // three facts whose bare name is `TextRange` — the class, and its two constructors — so this question came
-        // back `Ambiguous`, and the *token* `TextRange` then got no colour at all.
+        // **A class member's declaration cannot be what a bare spelling means.** `class TextRange { TextRange(); … }`
+        // files three facts whose bare name is `TextRange` — the class, and its two constructors — so this question
+        // came back `Ambiguous`, and the *token* `TextRange` then got no colour at all.
         //
         // Measured on EmmyLuaCodeStyle's `LuaParser/include/LuaParser/Ast/LuaSyntaxNode.h`: `LuaSyntaxTree` was
         // classified `Type` and `TextRange` was not, and the difference was exactly this — `LuaSyntaxTree` is only
@@ -3169,7 +3183,9 @@ impl ProjectIndex {
         // other meanings of it.
         //
         // A fact whose own qualified name is longer than the one asked about is a member, and a qualified request
-        // (`TextRange::StartOffset`) still matches: its qualified name is the name asked for.
+        // (`TextRange::StartOffset`) still matches: its qualified name is the name asked for. The drop applies to a
+        // **class** scope. A namespace is not a class — `std::sort` is what a bare `sort` means once `<algorithm>` is
+        // included, and dropping it because its qualified name is longer left the token with no colour at all.
         // **An enumerator is not a member for this question.** An unscoped enumeration's enumerators are visible in
         // the enclosing scope — `TK_ELSEIF` is written bare in `case TK_ELSEIF:` — and a scoped one's are what
         // `Color::Red` names with the qualifier dropped by the token being coloured. Their facts have a scope (the
@@ -3177,12 +3193,24 @@ impl ProjectIndex {
         // `EmmyLuaCodeStyle`, `TK_ELSEIF` declared in `LuaTokenTypeDetail.h` was filtered out here and the use in
         // `SpaceAnalyzer.cpp` got **no token at all** (`0 classification(s)`, and the editor drew it as
         // `variable.other.unknown`).
+        let mut class_scope: std::collections::HashMap<String, bool> =
+            std::collections::HashMap::new();
         let certain: Vec<_> = certain
             .into_iter()
             .filter(|found| {
-                found.fact.scope.is_none()
+                if found.fact.scope.is_none()
                     || found.fact.qualified_name() == name
                     || IndexedKind::of(&found.fact).enumerator
+                {
+                    return true;
+                }
+                let Some(scope) = found.fact.scope.as_deref() else {
+                    return true;
+                };
+                let names_a_class = *class_scope
+                    .entry(scope.to_string())
+                    .or_insert_with(|| self.scope_names_a_class(scope, visible_from));
+                !names_a_class
             })
             .collect();
 
@@ -3196,6 +3224,36 @@ impl ProjectIndex {
         match kinds.as_slice() {
             [only] => Known::Yes(only.clone()),
             [] => Known::Unknown(UnknownReason::ConditionalCompilation),
+            // **Every survivor is a function, so the colour is a function.** `std::sort` is a function template and
+            // another header declares the same spelling in a different namespace, or one of the overloads was filed
+            // without a template head. Those differ in [`IndexedKind::scope`] and [`IndexedKind::template`], and
+            // requiring both fields to agree answered `Ambiguous` — no token — for a name that is a function in every
+            // declaration the filter kept. A constructor is not folded in: it is drawn as the class's name.
+            many if many
+                .iter()
+                .all(|kind| kind.kind == DeclKind::Function && !kind.constructor) =>
+            {
+                Known::Yes(IndexedKind {
+                    kind: DeclKind::Function,
+                    scope: None,
+                    enumerator: false,
+                    template: false,
+                    constructor: false,
+                })
+            }
+            // **Every survivor is a type.** `std::vector` and `std::vector<bool>` are both the class, filed with
+            // different template heads, so the fields that are not the kind disagreed and the token for `vector` in
+            // `vector<int>` was left uncoloured. A constructor is not in this set: it was dropped with the other
+            // class members, and a class mixed with a function stays [`UnknownReason::Ambiguous`].
+            many if many.iter().all(|kind| kind.kind == DeclKind::Type) => {
+                Known::Yes(IndexedKind {
+                    kind: DeclKind::Type,
+                    scope: None,
+                    enumerator: false,
+                    template: false,
+                    constructor: false,
+                })
+            }
             _ => Known::Unknown(UnknownReason::Ambiguous(Box::from(name))),
         }
     }

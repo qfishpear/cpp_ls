@@ -473,16 +473,14 @@ impl AnalysisState {
         // **The expensive half with no lock at all.** `spawn_blocking` rather than the analysis pool: this work is
         // the background's, and it must not be one of the permits a request waits for.
         let prepared = match materials {
-            Some(materials) => {
-                match offload(move || materials.read_the_program()).await {
-                    Ok(prepared) => prepared,
-                    Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
-                    Err(error) => {
-                        log::error!("the background program read failed: {error}");
-                        return false;
-                    }
+            Some(materials) => match offload(move || materials.read_the_program()).await {
+                Ok(prepared) => prepared,
+                Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
+                Err(error) => {
+                    log::error!("the background program read failed: {error}");
+                    return false;
                 }
-            }
+            },
             None => None,
         };
 

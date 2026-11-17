@@ -467,6 +467,11 @@ pub fn classified_names(index: &ProjectIndex, view: &FileView) -> Vec<Name> {
                 .kind_of(&written, &view.path)
                 .value()
                 .and_then(kind_of_index)
+                // **A qualified name the index does not store under that spelling.** `ios::sync_with_stdio` is a
+                // member of the class `ios` names, inherited from a base; the stored name is the base's. The jump
+                // already asks that question. A colour that stops at the stored spelling leaves the token with the
+                // client's own identifier colour.
+                .or_else(|| kind_of_inherited_member(index, view, &shapes, &written))
         });
         if let Some(kind) = answer {
             out.push(Name {
@@ -981,6 +986,58 @@ fn kind_of_binding(
         | BindingKind::Label
         | BindingKind::Other => return None,
     })
+}
+
+/// **The kind of a member reached through a type's name**, when the stored qualified name is not the one written.
+///
+/// [`ProjectIndex::kind_of`] matches the spelling the index filed. A typedef of a derived class does not file the
+/// base's members under the typedef: `ios` is `typedef basic_ios<char> ios`, and `sync_with_stdio` is declared on
+/// `ios_base`, so `ios::sync_with_stdio` matches nothing and the token is left uncoloured. The jump answers this
+/// shape by [`members_of`] — the qualifier names a type, and the member list follows the alias and the bases — and
+/// a name that can be jumped to is a name that has a kind.
+///
+/// `None` when the qualifier is not a type (a namespace stays on the ordinary lookup), when the member list has no
+/// such name, or when the declarations of that name do not agree on a kind. Disagreeing is the same refusal as
+/// [`ProjectIndex::kind_of`]'s `Ambiguous`: a colour is a claim, and two claims is not one.
+fn kind_of_inherited_member(
+    index: &ProjectIndex,
+    view: &FileView,
+    shapes: &crate::sema::declarations::ShapeTable,
+    written: &str,
+) -> Option<NameKind> {
+    let (qualifier, member) = written.rsplit_once("::")?;
+    let qualifier = qualifier.trim_start_matches("::");
+    if qualifier.is_empty() || member.is_empty() {
+        return None;
+    }
+    // The same gate the jump uses. A namespace is not a class, and `members_of` on one would answer from a single
+    // file instead of the ordinary name lookup.
+    if !(index.scope_names_a_class(qualifier, &view.path)
+        || index.names_a_type(qualifier, &view.path))
+    {
+        return None;
+    }
+    let Known::Yes(list) = crate::index::project::members_of_with(
+        shapes,
+        index,
+        &view.scopes,
+        &view.root,
+        &view.path,
+        qualifier,
+    ) else {
+        return None;
+    };
+
+    let mut agreed = None;
+    for found in list.members.iter().filter(|one| one.fact.name == member) {
+        let kind = kind_of_index(IndexedKind::of(&found.fact))?;
+        match agreed {
+            None => agreed = Some(kind),
+            Some(have) if have == kind => {}
+            Some(_) => return None,
+        }
+    }
+    agreed
 }
 
 /// What an indexed declaration of this shape is, for a colour.
