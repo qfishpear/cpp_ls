@@ -531,10 +531,15 @@ async fn index_in_background(context: ServerContextSnapshot, version: i64) {
                             sizes.cooked_declarations,
                             session.memory_report()
                         );
+                        // `std::env::temp_dir()` panics on WASI ("no filesystem on wasm"), and the browser has no
+                        // `%TEMP%` for a reporter to open anyway.
+                        #[cfg(not(target_arch = "wasm32"))]
                         let _ = std::fs::write(
                             std::env::temp_dir().join("cpp_ls-memory.txt"),
                             report,
                         );
+                        #[cfg(target_arch = "wasm32")]
+                        let _ = report;
 
                         // **The pages are deliberately not handed back.** What was worth having is
                         // the *number* — `MemoryReport` in the file above — and the budgets that
