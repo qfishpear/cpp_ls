@@ -57,8 +57,9 @@ impl NativeFileWatcher {
         // **Files outside the root that still configure the project** — a `--config` a caller pointed elsewhere. A
         // recursive watch of the root cannot see one, and a configuration that is only read when the session opens is
         // exactly what this watcher exists to notice changing (`docs/worklog.md` P1-5).
+        // `String` rather than `notify::Result`: the wasm stub has the same signature and does not link notify.
         also: Vec<PathBuf>,
-    ) -> notify::Result<()> {
+    ) -> Result<(), String> {
         let mut current = self.state.lock().await;
         if let Some(state) = current.as_ref()
             && state.root == root
@@ -89,8 +90,11 @@ impl NativeFileWatcher {
                 }
                 callback_overflow.store(true, Ordering::Release);
             }
-        })?;
-        watcher.watch(&root, RecursiveMode::Recursive)?;
+        })
+        .map_err(|error| error.to_string())?;
+        watcher
+            .watch(&root, RecursiveMode::Recursive)
+            .map_err(|error| error.to_string())?;
         for path in &also {
             // One file, non-recursively: what a caller named is a configuration file, not a second workspace.
             if let Err(error) = watcher.watch(path, RecursiveMode::NonRecursive) {
@@ -402,7 +406,7 @@ mod tests {
         std::fs::create_dir(&root).unwrap();
         let (connection, _client) = Connection::memory();
         let server = crate::context::ServerContext::new(
-            Arc::new(connection),
+            crate::context::outbound_from_connection(Arc::new(connection)),
             ClientCapabilities::default(),
             crate::context::ClientId::Other,
             None,

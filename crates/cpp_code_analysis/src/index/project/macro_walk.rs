@@ -118,6 +118,7 @@ impl ProjectIndex {
     /// A timed wait in a loop rather than a plain `wait`: a notification that arrives between the caller's failed
     /// claim and this call would otherwise be lost, and the caller would wait for a walk that has already finished.
     /// The timeout costs one wakeup per 50 ms and makes a lost notification a delay instead of a hang.
+    #[cfg(not(target_arch = "wasm32"))]
     pub(crate) fn wait_for_the_walk(&self, root: &str) {
         let Ok(mut held) = self.walking.lock() else {
             return;
@@ -2202,7 +2203,9 @@ impl ProjectIndex {
         //
         // The loop is what makes the wait safe in both directions: the memo is re-checked after every wait, and a
         // walker that could not file an answer (a poisoned lock, a panic) leaves the next turn to become the walker.
+        #[cfg(not(target_arch = "wasm32"))]
         let waiting_since = std::time::Instant::now();
+        #[cfg(not(target_arch = "wasm32"))]
         let mut met = false;
         loop {
             if let Some(answer) = self.the_remembered_walk(&from) {
@@ -2213,6 +2216,10 @@ impl ProjectIndex {
             if self.claim_a_walk(&from) {
                 break;
             }
+            // The reactor is one thread. A claim that fails is this thread's own walk, and waiting would park it.
+            #[cfg(target_arch = "wasm32")]
+            break;
+            #[cfg(not(target_arch = "wasm32"))]
             if !met {
                 met = true;
                 self.walks_met
@@ -2221,9 +2228,11 @@ impl ProjectIndex {
             // **A walk that never finishes must not wedge a request for ever.** The bound is absurdly generous for a
             // real closure (the largest measured is 3.4 s) and exists only so that a defect in the walk is a slow
             // answer rather than a deadlock.
+            #[cfg(not(target_arch = "wasm32"))]
             if waiting_since.elapsed() > std::time::Duration::from_secs(30) {
                 break;
             }
+            #[cfg(not(target_arch = "wasm32"))]
             self.wait_for_the_walk(&from);
         }
         self.walks_built

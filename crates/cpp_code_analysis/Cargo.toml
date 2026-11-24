@@ -20,7 +20,6 @@ log.workspace = true
 glob.workspace = true
 rust-i18n.workspace = true
 redb.workspace = true
-zstd.workspace = true
 rustc-hash.workspace = true
 # **A summary's text is an identifier, not a document.** `SmolStr` keeps up to 22 bytes inline, so a declaration's name
 # costs no allocation at all — and a `FileSummary` is made of them: 486 783 declarations over 1 761 files on
@@ -28,3 +27,12 @@ rustc-hash.workspace = true
 # `serde` feature is on because a name ends up in an LSP payload (`typeHierarchyItem.data`), and converting at each
 # site is what the type should not need.
 smol_str.workspace = true
+
+# zstd-sys compiles C. wasm32-wasip1 has no wasi-sdk here, so the wasm build stores cache rows uncompressed.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+zstd.workspace = true
+
+[features]
+# **Test-only knobs a dependent crate's tests call.** Off for every build that is not itself a test of this crate,
+# unless that dependent opts in. `pretend_a_pause` is the one knob: it moves the editing clock without sleeping.
+test-support = []

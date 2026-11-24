@@ -3,15 +3,18 @@ use std::error::Error;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
+use crate::context::Outbound;
+use crate::context::outbound_from_connection;
+
 /// **How long after the shutdown answer the `exit` notification is waited for.** Long enough for a client that sends
 /// it immediately, short enough that a client that never sends one does not leave the process waiting.
 const EXIT_WAIT: std::time::Duration = std::time::Duration::from_millis(500);
 
 /// Async wrapper for LSP Connection with tokio support
 pub struct AsyncConnection {
-    pub(crate) connection: Arc<Connection>,
+    out: Outbound,
     receiver: mpsc::UnboundedReceiver<Message>,
-    _receiver_task: std::thread::JoinHandle<()>,
+    _reader: Option<std::thread::JoinHandle<()>>,
 }
 
 impl AsyncConnection {
@@ -25,7 +28,7 @@ impl AsyncConnection {
         // alive until the client closed the pipe — measured, and the whole of one report. A thread that is simply
         // detached ends with the process, which is the answer `shutdown` asks for.
         let connection_clone = connection.clone();
-        let receiver_task = std::thread::Builder::new()
+        let reader = std::thread::Builder::new()
             .name("cpp_ls-reader".to_string())
             .spawn(move || {
                 for msg in &connection_clone.receiver {
@@ -37,10 +40,23 @@ impl AsyncConnection {
             .expect("the reader thread starts");
 
         Self {
-            connection,
+            out: outbound_from_connection(connection),
             receiver: rx,
-            _receiver_task: receiver_task,
+            _reader: Some(reader),
         }
+    }
+
+    /// In-process session: the host owns the bytes, and nothing is reading stdin.
+    pub fn from_parts(out: Outbound, receiver: mpsc::UnboundedReceiver<Message>) -> Self {
+        Self {
+            out,
+            receiver,
+            _reader: None,
+        }
+    }
+
+    pub(crate) fn outbound(&self) -> Outbound {
+        Arc::clone(&self.out)
     }
 
     /// Receive message asynchronously
@@ -50,10 +66,8 @@ impl AsyncConnection {
 
     /// Send message to client
     pub fn send(&self, msg: Message) -> Result<(), Box<dyn Error + Send + Sync>> {
-        self.connection
-            .sender
-            .send(msg)
-            .map_err(|e| Box::new(e) as Box<dyn Error + Send + Sync>)
+        (self.out)(msg);
+        Ok(())
     }
 
     /// Handle shutdown request
@@ -74,9 +88,9 @@ impl AsyncConnection {
             return Ok(false);
         }
         let resp = Response::new_ok(req.id.clone(), ());
-        let _ = self.connection.sender.send(resp.into());
+        (self.out)(resp.into());
 
-        match tokio::time::timeout(EXIT_WAIT, self.receiver.recv()).await {
+        match crate::rt::timeout(EXIT_WAIT, self.receiver.recv()).await {
             Ok(Some(Message::Notification(n))) if n.method == "exit" => {}
             // Anything else after `shutdown` is a client that does not follow the protocol; ending is still better
             // than waiting for a message that will not come.

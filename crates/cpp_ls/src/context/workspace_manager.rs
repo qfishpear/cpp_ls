@@ -155,7 +155,7 @@ impl WorkspaceManager {
         }
 
         let reload_token = self.reload_token.clone();
-        tokio::spawn(async move {
+        crate::rt::spawn(async move {
             cancel_token.wait().await;
             if cancel_token.is_cancelled() {
                 // A newer event owns the wait now: it will see the newer database, so this one does nothing.
@@ -226,7 +226,7 @@ struct ReloadTaskHandles {
 fn spawn_workspace_reload_task(handles: ReloadTaskHandles, context: ServerContextSnapshot) {
     let generation = handles.reload_generation.fetch_add(1, Ordering::AcqRel) + 1;
 
-    tokio::spawn(async move {
+    crate::rt::spawn(async move {
         let _reload_guard = handles.reload_lock.lock().await;
         if generation != handles.reload_generation.load(Ordering::Acquire) {
             return;
@@ -265,7 +265,7 @@ impl DebounceToken {
 
     /// Wait out the quiet period, or return as soon as this token is superseded.
     async fn wait(&self) {
-        let _ = tokio::time::timeout(self.quiet, self.cancelled.cancelled()).await;
+        let _ = crate::rt::timeout(self.quiet, self.cancelled.cancelled()).await;
     }
 
     /// This token is superseded: the new event's wait replaces it, so this one must not reload.

@@ -41,6 +41,22 @@ pub struct CmdArgs {
     pub editor: Option<Editor>,
 }
 
+impl CmdArgs {
+    /// Arguments for the browser host. Nothing is read from argv or the environment: the log goes nowhere, and the
+    /// project configuration is the file the page mounts at a fixed path.
+    pub fn browser() -> Self {
+        Self {
+            communication: Communication::Stdio,
+            ip: "127.0.0.1".to_string(),
+            port: 5007,
+            log_level: LogLevel::Info,
+            log_path: NoneableString(None),
+            config: NoneableString(Some("/cppls/cppls.toml".to_string())),
+            editor: None,
+        }
+    }
+}
+
 /// Logging level enum
 #[derive(Debug, Clone, Copy)]
 #[cfg_attr(feature = "cli", derive(ValueEnum))]

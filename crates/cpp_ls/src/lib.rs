@@ -10,9 +10,13 @@ mod context;
 pub mod handlers;
 mod logger;
 pub mod probes;
+mod rt;
 mod server;
 mod util;
+#[cfg(target_arch = "wasm32")]
+mod wasm_host;
 
+#[cfg(feature = "cli")]
 pub use clap::Parser;
 pub use cmd_args::*;
 pub use server::{AsyncConnection, ExitError, run_ls};

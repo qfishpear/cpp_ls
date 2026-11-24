@@ -177,13 +177,7 @@ async fn the_built_in_answer(
     only: Option<Range>,
 ) -> Result<String, RequestOutcome<Vec<TextEdit>>> {
     let lines = only.map(|range| (range.start.line as usize, range.end.line as usize));
-    match tokio::task::spawn_blocking(move || format_with_the_builtin(&path, &text, lines)).await {
-        Ok(formatted) => Ok(formatted),
-        Err(error) => Err(RequestOutcome::Failed {
-            code: lsp_server::ErrorCode::InternalError,
-            message: format!("the built-in formatter did not finish: {error}"),
-        }),
-    }
+    Ok(crate::rt::offload(move || format_with_the_builtin(&path, &text, lines)).await)
 }
 
 /// **The built-in formatter**, which is a library call and knows nothing about the protocol.

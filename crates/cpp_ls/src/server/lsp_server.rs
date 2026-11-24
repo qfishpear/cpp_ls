@@ -44,7 +44,7 @@ impl LspServer {
         let client_id =
             crate::context::the_effective_client_id(cmd_args.editor.as_ref(), &params.client_info);
         let server_context = context::ServerContext::new(
-            connection.connection.clone(),
+            connection.outbound(),
             params.capabilities.clone(),
             client_id,
             params.initialization_options.as_ref(),

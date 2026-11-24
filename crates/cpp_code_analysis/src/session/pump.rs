@@ -1514,9 +1514,11 @@ impl<F: FileProvider + Clone> Session<F> {
                 std::sync::Arc::new(reading),
             ))
         };
+        // wasm reports no parallelism. Treating that as four cores would enter `thread::scope` on a runtime that
+        // cannot start a thread.
         let cores = std::thread::available_parallelism()
             .map(|cores| cores.get())
-            .unwrap_or(4)
+            .unwrap_or(if cfg!(target_arch = "wasm32") { 1 } else { 4 })
             .min(environments.len().max(1));
         let mut rendered = Vec::new();
         if cores <= 1 || environments.len() < 8 {

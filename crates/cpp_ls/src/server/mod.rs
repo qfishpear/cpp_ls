@@ -1,3 +1,4 @@
+pub(crate) mod browser_session;
 mod connection;
 mod error;
 mod lsp_server;
@@ -7,7 +8,9 @@ mod message_processor;
 pub use connection::AsyncConnection;
 pub use error::ExitError;
 
+use ::lsp_server::{Message, RequestId, Response};
 use lsp_types::InitializeParams;
+use serde_json::Value;
 use std::error::Error;
 
 use crate::cmd_args::{self, CmdArgs};
@@ -15,6 +18,51 @@ use crate::handlers::server_capabilities;
 
 const CRATE_NAME: &str = env!("CARGO_PKG_NAME");
 const CRATE_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// **A malformed `initialize` must be answered, not fatal.** It used to be `unwrap()`: a capability object that
+/// this build of `lsp_types` cannot deserialize — a required field a newer client omits, a field renamed — took
+/// the whole server down before it had answered anything, which an editor shows as "the language server crashed
+/// on startup" with no way to know why. Measured with a real client shape: `textDocument.semanticTokens` without
+/// `requests` panicked with `missing field 'requests'`. The protocol's answer to a request the server cannot
+/// understand is an **error response with `InvalidParams`**, and the client stays alive to report it.
+fn read_initialize(params: Value) -> Result<InitializeParams, String> {
+    serde_json::from_value(params)
+        .map_err(|error| format!("cannot read initialize params: {error}"))
+}
+
+/// `InvalidParams`, as the protocol defines it (JSON-RPC **-32602**), and **not** a successful initialize result.
+fn reject_initialize(id: RequestId, message: String) -> Message {
+    Message::Response(Response::new_err(id, -32602, message))
+}
+
+/// **The type hierarchy capability is written into the JSON by hand.** The protocol's field is
+/// `typeHierarchyProvider` (LSP 3.17, `textDocument/prepareTypeHierarchy`), and the `lsp_types` fork this server
+/// links against predates it: its `ServerCapabilities` has no such field, so the typed value cannot carry it. A
+/// client reads the raw JSON, so this is the one place the capability can be stated — and the handlers behind it
+/// are real (`handlers::type_hierarchy`). `tests/handshake.rs` asserts it crosses the wire, because a client that
+/// does not see it never asks and the handlers would be dead code however correct they are.
+fn accept_initialize(params: &InitializeParams) -> Result<Value, serde_json::Error> {
+    let mut capabilities = serde_json::to_value(server_capabilities(&params.capabilities))?;
+    if let Some(object) = capabilities.as_object_mut() {
+        object.insert("typeHierarchyProvider".to_string(), Value::Bool(true));
+        // **clangd's inactive-region notification is an extension, so its flag is written by hand too.** A client
+        // that asked for it (see `context::wants_inactive_regions`) is told the server sends it; a client that did not
+        // sees nothing, because a client that never heard of the method would only log an unhandled notification.
+        if crate::context::wants_inactive_regions(
+            &params.capabilities,
+            params.initialization_options.as_ref(),
+        ) {
+            object.insert("inactiveRegionsProvider".to_string(), Value::Bool(true));
+        }
+    }
+    Ok(serde_json::json!({
+        "capabilities": capabilities,
+        "serverInfo": {
+            "name": CRATE_NAME,
+            "version": CRATE_VERSION
+        }
+    }))
+}
 
 #[allow(unused)]
 pub async fn run_ls(cmd_args: CmdArgs) -> Result<(), Box<dyn Error + Sync + Send>> {
@@ -29,63 +77,14 @@ pub async fn run_ls(cmd_args: CmdArgs) -> Result<(), Box<dyn Error + Sync + Send
     };
 
     let (id, params) = connection.initialize_start()?;
-    // **A malformed `initialize` must be answered, not fatal.** It used to be `unwrap()`: a capability object that
-    // this build of `lsp_types` cannot deserialize — a required field a newer client omits, a field renamed — took
-    // the whole server down before it had answered anything, which an editor shows as "the language server crashed
-    // on startup" with no way to know why. Measured with a real client shape: `textDocument.semanticTokens` without
-    // `requests` panicked with `missing field 'requests'`. The protocol's answer to a request the server cannot
-    // understand is an **error response with `InvalidParams`**, and the client stays alive to report it.
-    let initialization_params: InitializeParams = match serde_json::from_value(params) {
+    let initialization_params = match read_initialize(params) {
         Ok(params) => params,
-        Err(error) => {
-            // `InvalidParams`, as the protocol defines it (JSON-RPC **-32602**), and **not** `initialize_finish`: that
-            // sends a successful response, and a client reading `result` out of an error payload is the failure a
-            // wrong code would produce. `::lsp_server` with the leading `::` because this module has a *local*
-            // `lsp_server` (the thin wrapper over the crate) that would otherwise be the one named.
-            connection.sender.send(::lsp_server::Message::Response(
-                ::lsp_server::Response::new_err(
-                    id,
-                    -32602,
-                    format!("cannot read initialize params: {error}"),
-                ),
-            ))?;
+        Err(message) => {
+            connection.sender.send(reject_initialize(id, message))?;
             return Ok(());
         }
     };
-    // **The type hierarchy capability is written into the JSON by hand.** The protocol's field is
-    // `typeHierarchyProvider` (LSP 3.17, `textDocument/prepareTypeHierarchy`), and the `lsp_types` fork this server
-    // links against predates it: its `ServerCapabilities` has no such field, so the typed value cannot carry it. A
-    // client reads the raw JSON, so this is the one place the capability can be stated — and the handlers behind it
-    // are real (`handlers::type_hierarchy`). `tests/handshake.rs` asserts it crosses the wire, because a client that
-    // does not see it never asks and the handlers would be dead code however correct they are.
-    let mut server_capabilities =
-        serde_json::to_value(server_capabilities(&initialization_params.capabilities))?;
-    if let Some(object) = server_capabilities.as_object_mut() {
-        object.insert(
-            "typeHierarchyProvider".to_string(),
-            serde_json::Value::Bool(true),
-        );
-        // **clangd's inactive-region notification is an extension, so its flag is written by hand too.** A client
-        // that asked for it (see `context::wants_inactive_regions`) is told the server sends it; a client that did not
-        // sees nothing, because a client that never heard of the method would only log an unhandled notification.
-        if crate::context::wants_inactive_regions(
-            &initialization_params.capabilities,
-            initialization_params.initialization_options.as_ref(),
-        ) {
-            object.insert(
-                "inactiveRegionsProvider".to_string(),
-                serde_json::Value::Bool(true),
-            );
-        }
-    }
-    let initialize_data = serde_json::json!({
-        "capabilities": server_capabilities,
-        "serverInfo": {
-            "name": CRATE_NAME,
-            "version": CRATE_VERSION
-        }
-    });
-
+    let initialize_data = accept_initialize(&initialization_params)?;
     connection.initialize_finish(id, initialize_data)?;
 
     // Create async connection wrapper

@@ -74,7 +74,7 @@ impl DiagnosticService {
             }
         }
 
-        tokio::spawn(async move {
+        crate::rt::spawn(async move {
             loop {
                 let outcome = compute(&context, &uri, cancel.clone()).await;
                 if !context
@@ -150,10 +150,10 @@ impl DiagnosticService {
         {
             return;
         }
-        tokio::spawn(async move {
+        crate::rt::spawn(async move {
             tokio::select! {
                 _ = context.diagnostics().shutdown.cancelled() => {}
-                _ = tokio::time::sleep(REFRESH_DELAY) => {
+                _ = crate::rt::sleep(REFRESH_DELAY) => {
                     context.diagnostics().refresh_scheduled.store(false, Ordering::Release);
                     context.client().refresh_diagnostics();
                 }
@@ -193,8 +193,7 @@ async fn compute(
         .diagnostics()
         .change_delay_ms
         .load(Ordering::Acquire);
-    let Some(deadline) = tokio::time::Instant::now().checked_add(Duration::from_millis(delay))
-    else {
+    let Some(deadline) = crate::rt::now().checked_add(Duration::from_millis(delay)) else {
         return RequestOutcome::Failed {
             code: lsp_server::ErrorCode::InvalidParams,
             message: format!("diagnostic debounce {delay} ms exceeds the supported timer range"),
@@ -202,7 +201,7 @@ async fn compute(
     };
     tokio::select! {
         _ = cancel.cancelled() => return RequestOutcome::Cancelled(CancelSource::Client),
-        _ = tokio::time::sleep_until(deadline) => {}
+        _ = crate::rt::sleep_until(deadline) => {}
     }
 
     let upto = context.inbox().queued();

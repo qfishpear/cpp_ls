@@ -3,7 +3,10 @@ mod client;
 mod client_id;
 mod diagnostics;
 mod lsp_features;
+#[cfg(not(target_arch = "wasm32"))]
 mod native_watcher;
+#[cfg(target_arch = "wasm32")]
+mod native_watcher_stub;
 mod query_runner;
 mod snapshot;
 mod status_bar;
@@ -12,13 +15,17 @@ mod workspace_manager;
 mod workspace_state;
 pub use analysis_state::AnalysisState;
 pub use client::ClientProxy;
+pub use client::{Outbound, outbound_from_connection};
 pub use client_id::{ClientId, the_effective_client_id};
 pub use diagnostics::DiagnosticService;
 pub use lsp_features::LspFeatures;
 pub(crate) use lsp_features::wants_inactive_regions;
-use lsp_server::{Connection, ErrorCode, RequestId, Response};
+use lsp_server::{ErrorCode, RequestId, Response};
 use lsp_types::ClientCapabilities;
+#[cfg(not(target_arch = "wasm32"))]
 pub use native_watcher::NativeFileWatcher;
+#[cfg(target_arch = "wasm32")]
+pub use native_watcher_stub::NativeFileWatcher;
 pub use query_runner::{CancelSource, RequestOutcome, snapshot_query};
 pub use snapshot::ServerContextSnapshot;
 pub use status_bar::ProgressTask;
@@ -32,6 +39,23 @@ pub use workspace_manager::WorkspaceManager;
 use crate::context::snapshot::ServerContextInner;
 use crate::util::catch_unwind;
 
+#[cfg(test)]
+std::thread_local! {
+    static LIVE_ANALYSIS: std::cell::RefCell<Option<Arc<AnalysisState>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// The analysis of the server most recently built on this thread. Browser-session tests reach the editing clock
+/// through it; production never asks.
+#[cfg(test)]
+pub(crate) fn live_analysis() -> Option<Arc<AnalysisState>> {
+    LIVE_ANALYSIS.with(|slot| slot.borrow().clone())
+}
+
+#[cfg(test)]
+pub(crate) fn clear_live_analysis() {
+    LIVE_ANALYSIS.with(|slot| *slot.borrow_mut() = None);
+}
+
 pub struct ServerContext {
     cancellations: Arc<Mutex<HashMap<RequestId, CancellationToken>>>,
     inner: Arc<ServerContextInner>,
@@ -39,14 +63,16 @@ pub struct ServerContext {
 
 impl ServerContext {
     pub fn new(
-        conn: Arc<Connection>,
+        out: Outbound,
         client_capabilities: ClientCapabilities,
         client_id: ClientId,
         initialization_options: Option<&serde_json::Value>,
     ) -> Self {
-        let client = Arc::new(ClientProxy::new(conn));
+        let client = Arc::new(ClientProxy::new(out));
 
         let analysis = Arc::new(AnalysisState::new());
+        #[cfg(test)]
+        LIVE_ANALYSIS.with(|slot| *slot.borrow_mut() = Some(Arc::clone(&analysis)));
         let lsp_features = Arc::new(LspFeatures::new(
             client_capabilities,
             client_id,
@@ -100,7 +126,7 @@ impl ServerContext {
         let cancellations = self.cancellations.clone();
         let mut started_changes = self.inner.inbox.started_changes();
 
-        tokio::spawn(async move {
+        crate::rt::spawn(async move {
             let changed = async {
                 loop {
                     if *started_changes.borrow_and_update() > upto {

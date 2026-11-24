@@ -178,7 +178,8 @@ pub async fn start_analysis(context: ServerContextSnapshot) {
             // **`CPPLS_NO_WATCH` is an A/B switch, not a setting**: with it set no OS watcher runs, which is how a
             // run can tell whether the watcher's own loop is what burns a core and grows the process. The project's
             // own answer is `[workspace] native_watch = false`, which is a decision rather than a probe — a checkout
-            // whose events are noise, or a reader who would rather trust the editor.
+            // whose events are noise, or a reader who would rather trust the editor. The reactor has no inotify;
+            // the browser pushes changes itself.
             let watching_off = context
                 .analysis()
                 .with_snapshot(|session| {
@@ -190,13 +191,15 @@ pub async fn start_analysis(context: ServerContextSnapshot) {
                         .is_some_and(|wanted| !wanted)
                 })
                 .unwrap_or(false);
-            if watching_off {
-                log::info!(
-                    "the native watcher is off: the project's own configuration says \
-                     `[workspace] native_watch = false`"
-                );
-            } else if crate::probes::no_watch() {
-                log::info!("the native watcher is off (CPPLS_NO_WATCH)");
+            if watching_off || crate::probes::no_watch() || crate::rt::on_executor() {
+                let reason = if crate::rt::on_executor() {
+                    ""
+                } else if watching_off {
+                    ": the project's own configuration says `[workspace] native_watch = false`"
+                } else {
+                    " (CPPLS_NO_WATCH)"
+                };
+                log::info!("the native watcher is off{reason}");
             } else if let Err(error) = context
                 .native_watcher()
                 .start(
@@ -240,11 +243,11 @@ pub async fn start_analysis(context: ServerContextSnapshot) {
     // **A once-a-second account of the two queues**, under the trace only: how many events the client sent and how
     // many the applier has applied, and what the pump is waiting for. A process that burns a core while both
     // counters stand still is neither of them.
-    if crate::probes::pump() {
+    if crate::probes::pump() && !crate::rt::on_executor() {
         let watched = context.clone();
-        tokio::spawn(async move {
+        crate::rt::spawn(async move {
             loop {
-                tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                crate::rt::sleep(std::time::Duration::from_secs(1)).await;
                 let inbox = (watched.inbox().queued(), watched.inbox().applied());
                 let session = watched
                     .analysis()
@@ -479,7 +482,7 @@ fn report_project_configuration(context: &ServerContextSnapshot) {
 /// every query in a file the user has typed in would be "not read yet" — so the pump is what makes an edit visible
 /// again, and it is one task rather than a rule every handler would have to remember.
 async fn index_in_background(context: ServerContextSnapshot, version: i64) {
-    tokio::spawn(async move {
+    crate::rt::spawn(async move {
         let mut first_pass = true;
         let mut last_diagnostic_revision = None;
         // What the last slice left to do — see the drain below, which is the moment a file's **cooked** reading
@@ -535,9 +538,10 @@ async fn index_in_background(context: ServerContextSnapshot, version: i64) {
                 eprintln!("[read] next open file to read: {}", path.display());
             }
             if let Some(path) = open_file
-                && context.analysis().read_queued_file(&path).await
+                && context.analysis().read_queued_file_silently(&path).await
             {
                 was_pending = true;
+                crate::rt::yield_now().await;
                 continue;
             }
 
@@ -650,10 +654,15 @@ async fn index_in_background(context: ServerContextSnapshot, version: i64) {
                             sizes.cooked_declarations,
                             session.memory_report()
                         );
+                        // `std::env::temp_dir()` panics on WASI ("no filesystem on wasm"), and the browser has no
+                        // `%TEMP%` for a reporter to open anyway.
+                        #[cfg(not(target_arch = "wasm32"))]
                         let _ = std::fs::write(
                             std::env::temp_dir().join("cpp_ls-memory.txt"),
                             report,
                         );
+                        #[cfg(target_arch = "wasm32")]
+                        let _ = report;
 
                         // **The pages are deliberately not handed back.** What was worth having is
                         // the *number* — `MemoryReport` in the file above — and the budgets that
@@ -720,9 +729,11 @@ async fn index_in_background(context: ServerContextSnapshot, version: i64) {
                         Some(record) => (Some(record), None),
                         None => (None, session.gather_a_cook(path)),
                     };
+                    // wasm reports no parallelism. Treating that as four cores would enter `thread::scope` on a
+                    // runtime that cannot start a thread.
                     let cores = std::thread::available_parallelism()
                         .map(|cores| cores.get())
-                        .unwrap_or(4)
+                        .unwrap_or(if cfg!(target_arch = "wasm32") { 1 } else { 4 })
                         .min(claimed.len().max(1));
                     let mut stored = Vec::new();
                     let mut cooks = Vec::new();
@@ -1028,7 +1039,7 @@ async fn index_in_background(context: ServerContextSnapshot, version: i64) {
                 if did_nothing {
                     context.analysis().wait_for_work(IDLE_WAIT).await;
                 } else {
-                    tokio::task::yield_now().await;
+                    crate::rt::yield_now().await;
                 }
                 continue;
             }
@@ -1063,7 +1074,7 @@ async fn index_in_background(context: ServerContextSnapshot, version: i64) {
                     // Go round again rather than publish an answer computed before they were read: the next pass
                     // reads them in slices, and the end-of-drain refresh below runs once they are in.
                     was_pending = true;
-                    tokio::task::yield_now().await;
+                    crate::rt::yield_now().await;
                     continue;
                 }
             }
@@ -1208,6 +1219,17 @@ async fn index_in_background(context: ServerContextSnapshot, version: i64) {
                     );
                 }
                 if wait.is_zero() {
+                    crate::rt::yield_now().await;
+                    // An edit during the yield drops the open file's summary. The program read is of the text that
+                    // edit wrote, so the summary has to be that text before the read looks. One queued file, and
+                    // only when the queue has one: a quiet period with nothing edited finds nothing here.
+                    if let Some(path) = context
+                        .analysis()
+                        .with_snapshot(|session| session.next_open_file_to_read())
+                        .flatten()
+                    {
+                        let _ = context.analysis().read_queued_file_silently(&path).await;
+                    }
                     // **Then breathe.** A project has one program per translation unit, and a pump that read them
                     // back to back would peg a core for minutes after every pause; one idle tick between them is
                     // the same pace the loop uses when it has nothing to do.
@@ -1308,7 +1330,7 @@ mod tests {
     async fn a_built_session_receives_the_latest_buffer_at_installation() {
         let (connection, _client) = Connection::memory();
         let server = ServerContext::new(
-            Arc::new(connection),
+            crate::context::outbound_from_connection(Arc::new(connection)),
             ClientCapabilities::default(),
             ClientId::Other,
             None,
@@ -1348,7 +1370,7 @@ mod tests {
     async fn a_session_built_for_an_old_workspace_is_not_installed() {
         let (connection, _client) = Connection::memory();
         let server = ServerContext::new(
-            Arc::new(connection),
+            crate::context::outbound_from_connection(Arc::new(connection)),
             ClientCapabilities::default(),
             ClientId::Other,
             None,

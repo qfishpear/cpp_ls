@@ -1,19 +1,22 @@
+#[cfg(not(target_arch = "wasm32"))]
 mod best_log_path;
+#[cfg(target_arch = "wasm32")]
+mod wasm_stderr;
 
-use std::{env, fs, path::PathBuf};
-
-use crate::util::path_to_uri;
-use best_log_path::get_best_log_dir;
+#[cfg(not(target_arch = "wasm32"))]
 use chrono::Local;
-use fern::Dispatch;
-use log::{LevelFilter, info};
+use log::LevelFilter;
+#[cfg(not(target_arch = "wasm32"))]
+use log::info;
 
 use crate::cmd_args::{CmdArgs, LogLevel};
 
+#[cfg(not(target_arch = "wasm32"))]
 const CRATE_NAME: &str = env!("CARGO_PKG_NAME");
+#[cfg(not(target_arch = "wasm32"))]
 const CRATE_VERSION: &str = env!("CARGO_PKG_VERSION");
 
-pub fn init_logger(root: Option<&str>, cmd_args: &CmdArgs) -> Option<PathBuf> {
+pub fn init_logger(root: Option<&str>, cmd_args: &CmdArgs) -> Option<std::path::PathBuf> {
     let level = match cmd_args.log_level {
         LogLevel::Error => LevelFilter::Error,
         LogLevel::Warn => LevelFilter::Warn,
@@ -21,6 +24,38 @@ pub fn init_logger(root: Option<&str>, cmd_args: &CmdArgs) -> Option<PathBuf> {
         LogLevel::Debug => LevelFilter::Debug,
         LogLevel::Trace => LevelFilter::Trace,
     };
+
+    // Fern's channel output is an `std` mpsc sender, and that sender yields the thread. The reactor has no such
+    // import, so it logs on stderr without fern. A browser session calls this from the executor.
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = (root, cmd_args);
+        wasm_stderr::init(level);
+        return None;
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        if crate::rt::on_executor() {
+            init_stderr_logger(level);
+            return None;
+        }
+        return init_file_logger(root, cmd_args, level);
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn init_file_logger(
+    root: Option<&str>,
+    cmd_args: &CmdArgs,
+    level: LevelFilter,
+) -> Option<std::path::PathBuf> {
+    use std::{fs, path::PathBuf};
+
+    use fern::Dispatch;
+
+    use crate::util::path_to_uri;
+    use best_log_path::get_best_log_dir;
 
     let cmd_log_path = cmd_args.log_path.clone();
     if root.is_none() && cmd_log_path.0.is_none() {
@@ -98,7 +133,10 @@ pub fn init_logger(root: Option<&str>, cmd_args: &CmdArgs) -> Option<PathBuf> {
     Some(log_file_path)
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn init_stderr_logger(level: LevelFilter) {
+    use fern::Dispatch;
+
     let logger = Dispatch::new()
         .format(|out, message, record| {
             out.finish(format_args!(
@@ -109,13 +147,13 @@ fn init_stderr_logger(level: LevelFilter) {
                 message
             ))
         })
-        // set level
         .level(level)
-        // set output
         .chain(std::io::stderr());
 
-    if let Err(e) = logger.apply() {
-        eprintln!("Failed to apply logger: {:?}", e);
+    if let Err(error) = logger.apply() {
+        if !crate::rt::on_executor() {
+            eprintln!("Failed to apply logger: {:?}", error);
+        }
         return;
     }
 

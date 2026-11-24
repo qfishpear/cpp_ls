@@ -27,7 +27,6 @@ use std::path::Path;
 use std::sync::{LazyLock, Mutex};
 
 use lsp_types::Range;
-use tokio::io::AsyncWriteExt;
 use tokio_util::sync::CancellationToken;
 
 /// **The names `[format] formatter` may use for the built-in formatter.** The crate is `cpp_formatter`, the command
@@ -140,7 +139,10 @@ pub fn lines_of(range: Range) -> (u32, u32) {
 /// **Run `program` as clang-format over `text`**, and answer its stdout.
 ///
 /// The text is written on stdin in a task of its own, so a program that writes before it has read everything cannot
-/// deadlock against this one; `kill_on_drop` is what makes a cancelled request take the child with it.
+/// deadlock against this one; `kill_on_drop` is what makes a cancelled request take the child with it. The browser
+/// host cannot start a program, so that build answers [`Failure::Unusable`] and the caller uses the built-in
+/// formatter.
+#[cfg(target_arch = "wasm32")]
 pub async fn format_with_clang_format(
     program: &str,
     path: &Path,
@@ -148,6 +150,22 @@ pub async fn format_with_clang_format(
     lines: Option<(u32, u32)>,
     cancel_token: &CancellationToken,
 ) -> Result<String, Failure> {
+    let _ = (program, path, text, lines, cancel_token);
+    Err(Failure::Unusable(
+        "the browser host cannot start a program".to_string(),
+    ))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub async fn format_with_clang_format(
+    program: &str,
+    path: &Path,
+    text: &str,
+    lines: Option<(u32, u32)>,
+    cancel_token: &CancellationToken,
+) -> Result<String, Failure> {
+    use tokio::io::AsyncWriteExt;
+
     let mut command = tokio::process::Command::new(program);
     command
         .args(clang_format_arguments(path, lines))

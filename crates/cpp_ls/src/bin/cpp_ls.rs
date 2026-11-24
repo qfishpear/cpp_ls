@@ -1,7 +1,9 @@
 use clap::Parser;
 use cpp_ls::cmd_args::CmdArgs;
-use mimalloc_safe::MiMalloc;
 use std::error::Error;
+
+#[cfg(not(target_arch = "wasm32"))]
+use mimalloc_safe::MiMalloc;
 
 /// **The allocator the server ships with, and nothing wrapped around it.**
 ///
@@ -9,10 +11,12 @@ use std::error::Error;
 /// trace (`CPPLS_TRACE_ALLOCS`) could print a stage's *held* bytes. The numbers it produced are in
 /// `docs/open-questions.md`, and the instrument is gone: an allocator whose hot path carries a counter for a switch
 /// that is off in every release is a cost paid by every user for a measurement nobody is taking. A profile now comes
-/// from a profiler, not from the binary.
+/// from a profiler, not from the binary. wasm has no mimalloc; that build uses the system allocator.
+#[cfg(not(target_arch = "wasm32"))]
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
 
+#[cfg(not(target_arch = "wasm32"))]
 fn main() -> Result<(), Box<dyn Error + Sync + Send>> {
     let cmd_args = CmdArgs::parse();
 
@@ -28,3 +32,6 @@ fn main() -> Result<(), Box<dyn Error + Sync + Send>> {
     runtime.shutdown_timeout(std::time::Duration::from_millis(250));
     result
 }
+
+#[cfg(target_arch = "wasm32")]
+fn main() {}

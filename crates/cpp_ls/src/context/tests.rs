@@ -25,7 +25,7 @@ async fn response(connection: &Connection) -> Response {
 async fn a_cancelled_request_answers_without_waiting_for_its_work() {
     let (server, client) = Connection::memory();
     let context = ServerContext::new(
-        Arc::new(server),
+        super::outbound_from_connection(Arc::new(server)),
         ClientCapabilities::default(),
         ClientId::Other,
         None,
@@ -50,7 +50,7 @@ async fn a_cancelled_request_answers_without_waiting_for_its_work() {
 async fn a_request_is_not_answered_from_a_later_document_version() {
     let (server, client) = Connection::memory();
     let context = ServerContext::new(
-        Arc::new(server),
+        super::outbound_from_connection(Arc::new(server)),
         ClientCapabilities::default(),
         ClientId::Other,
         None,

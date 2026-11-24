@@ -21,7 +21,7 @@ pub(super) async fn main_loop(
 
     // Start initialization process
     let server_context_snapshot = server.server_context.snapshot();
-    tokio::spawn(async move {
+    crate::rt::spawn(async move {
         initialized_handler(server_context_snapshot, params, cmd_args).await;
         let _ = init_tx.send(());
     });

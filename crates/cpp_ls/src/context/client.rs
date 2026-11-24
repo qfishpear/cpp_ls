@@ -3,7 +3,7 @@ use std::{
     sync::{Arc, atomic::AtomicI32},
 };
 
-use lsp_server::{Connection, Message, Notification, RequestId, Response};
+use lsp_server::{Message, Notification, RequestId, Response};
 use lsp_types::{
     ApplyWorkspaceEditParams, ApplyWorkspaceEditResponse, ConfigurationParams, MessageActionItem,
     RegistrationParams, ShowMessageParams, ShowMessageRequestParams, UnregistrationParams,
@@ -15,17 +15,26 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
+/// Bytes the server sends to the client. One closure for stdio and for an in-process session.
+pub type Outbound = Arc<dyn Fn(Message) + Send + Sync>;
+
+pub fn outbound_from_connection(connection: Arc<lsp_server::Connection>) -> Outbound {
+    Arc::new(move |message| {
+        let _ = connection.sender.send(message);
+    })
+}
+
 pub struct ClientProxy {
-    conn: Arc<Connection>,
+    out: Outbound,
     id_counter: AtomicI32,
     response_manager: Arc<Mutex<HashMap<RequestId, oneshot::Sender<Response>>>>,
 }
 
 #[allow(unused)]
 impl ClientProxy {
-    pub fn new(conn: Arc<Connection>) -> Self {
+    pub fn new(out: Outbound) -> Self {
         Self {
-            conn,
+            out,
             id_counter: AtomicI32::new(0),
             response_manager: Arc::new(Mutex::new(HashMap::new())),
         }
@@ -33,7 +42,7 @@ impl ClientProxy {
 
     /// Unified outgoing message entry point.
     pub fn send_message(&self, message: Message) {
-        let _ = self.conn.sender.send(message);
+        (self.out)(message);
     }
 
     /// Send a Response to the client.
@@ -131,7 +140,7 @@ impl ClientProxy {
     ) -> Result<(), String> {
         let request_id = self.next_id();
         let cancel_token = tokio_util::sync::CancellationToken::new();
-        let answer = tokio::time::timeout(
+        let answer = crate::rt::timeout(
             std::time::Duration::from_secs(5),
             self.send_request(
                 request_id,

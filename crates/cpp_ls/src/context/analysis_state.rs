@@ -369,7 +369,18 @@ impl AnalysisState {
         .flatten()
     }
 
+    /// Read one queued file and, when it was committed, tell the pump the queue has changed.
     pub async fn read_queued_file(&self, path: &std::path::Path) -> bool {
+        let committed = self.read_queued_file_silently(path).await;
+        if committed {
+            self.wake();
+        }
+        committed
+    }
+
+    /// [`AnalysisState::read_queued_file`] without the wake. For the pump itself: it is already running, and the
+    /// notification would only make its next idle wait return at once.
+    pub async fn read_queued_file_silently(&self, path: &std::path::Path) -> bool {
         let guard = self.file_read_gate.clone().lock_owned().await;
         let path = path.to_path_buf();
         let gathered = self
@@ -380,25 +391,12 @@ impl AnalysisState {
         let Some((Some(materials), guard)) = gathered else {
             return false;
         };
-        let prepared = tokio::task::spawn_blocking(move || (materials.read(), guard)).await;
-        let (prepared, _guard) = match prepared {
-            Ok(prepared) => prepared,
-            Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
-            Err(error) => {
-                log::error!("the background file read failed: {error}");
-                return false;
-            }
-        };
-        let committed = self
-            .update_session("commit a file read", move |session| {
-                session.commit_a_file_read(prepared)
-            })
-            .await
-            .unwrap_or(false);
-        if committed {
-            self.wake();
-        }
-        committed
+        let (prepared, _guard) = crate::rt::offload(move || (materials.read(), guard)).await;
+        self.update_session("commit a file read", move |session| {
+            session.commit_a_file_read(prepared)
+        })
+        .await
+        .unwrap_or(false)
     }
 
     pub async fn render_cooks(
@@ -415,19 +413,11 @@ impl AnalysisState {
                 return Vec::new();
             }
         };
-        match tokio::task::spawn_blocking(move || {
+        crate::rt::offload(move || {
             let _permit = permit;
             cooks.into_iter().filter_map(|cook| cook.render()).collect()
         })
         .await
-        {
-            Ok(rendered) => rendered,
-            Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
-            Err(error) => {
-                log::error!("rendering failed: {error}");
-                Vec::new()
-            }
-        }
     }
 
     /// Tell the indexing pump that the queue has work in it.
@@ -460,16 +450,20 @@ impl AnalysisState {
     /// context, so it must not occupy an `async` one: a 4.9 second task on the runtime would take
     /// the executor away from every request in flight — the same reason `run_blocking` exists.
     ///
-    /// Returns whether a program was attempted. `false` when none was owed, or when the clock
-    /// ([`cpp_code_analysis::Session::the_program_to_read`]) or the size budget said no.
+    /// Returns whether a program was attempted. `false` when none was owed, or when the size budget said no.
+    /// **The quiet period is not checked here**: the caller is the pump, which has already waited it out
+    /// ([`cpp_code_analysis::Session::the_wait_before_a_program_may_be_read`]) and yielded since.
     pub async fn read_a_program(&self) -> bool {
         // **The four phases, timed.** This is the server's largest unprompted piece of work and every one of its parts
         // has been a separate investigation — the walk, the cook and the parse, the per-file records, the inserts — so
         // the line that says what a program read cost is the instrument the next one starts from.
+        // The pump already waited out the quiet period, then yielded so a keystroke could land. Asking the clock
+        // again would treat that keystroke as a reason to skip the read; the text it just wrote is what the read
+        // is for.
         let started = std::time::Instant::now();
         let Some(Some((root, revision))) = self.with_snapshot(|session| {
             session
-                .the_program_to_read()
+                .the_next_unit_to_read()
                 .map(|root| (root, session.revision()))
         }) else {
             return false;
@@ -487,16 +481,7 @@ impl AnalysisState {
         // **The expensive half with no lock at all.** `spawn_blocking` rather than the analysis pool: this work is
         // the background's, and it must not be one of the permits a request waits for.
         let prepared = match materials {
-            Some(materials) => {
-                match tokio::task::spawn_blocking(move || materials.read_the_program()).await {
-                    Ok(prepared) => prepared,
-                    Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
-                    Err(error) => {
-                        log::error!("the background program read failed: {error}");
-                        return false;
-                    }
-                }
-            }
+            Some(materials) => crate::rt::offload(move || materials.read_the_program()).await,
             None => None,
         };
         let gathered = started.elapsed() - choosing;
@@ -516,11 +501,12 @@ impl AnalysisState {
         let records = match &prepared {
             Some(reading) => {
                 let reading = reading.clone();
-                // **`spawn_blocking`, not `run_blocking`**: the latter takes one of the **permits a request waits for**,
+                // **`offload`, not `run_blocking`**: the latter takes one of the **permits a request waits for**,
                 // and this is eighteen seconds of environment building for neovim's `ui.c` — the background's work, on
-                // the same terms as the program read above, which takes no permit for exactly this reason.
+                // the same terms as the program read above, which takes no permit for exactly this reason. Off the
+                // executor this is `spawn_blocking`; the reactor runs it inline.
                 let inner = self.inner.clone();
-                tokio::task::spawn_blocking(move || {
+                crate::rt::offload(move || {
                     let session = inner
                         .read()
                         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -530,7 +516,6 @@ impl AnalysisState {
                         .unwrap_or_default()
                 })
                 .await
-                .unwrap_or_default()
             }
             None => Vec::new(),
         };
@@ -585,7 +570,7 @@ impl AnalysisState {
     /// permit, so a wake that arrives before this call is not lost — but a stall would leave the index empty for
     /// the rest of the session, and one lock acquisition a second is a cheap way never to find out.
     pub async fn wait_for_work(&self, timeout: Duration) -> bool {
-        tokio::time::timeout(timeout, self.work.notified())
+        crate::rt::timeout(timeout, self.work.notified())
             .await
             .is_ok()
     }
@@ -611,7 +596,7 @@ impl AnalysisState {
         at_most: Duration,
         cancel: &tokio_util::sync::CancellationToken,
     ) -> bool {
-        let deadline = std::time::Instant::now() + at_most;
+        let deadline = crate::rt::now() + at_most;
         loop {
             if cancel.is_cancelled() {
                 return false;
@@ -622,7 +607,7 @@ impl AnalysisState {
             {
                 return true;
             }
-            let left = deadline.saturating_duration_since(std::time::Instant::now());
+            let left = deadline.saturating_duration_since(crate::rt::now());
             if left.is_zero() {
                 return false;
             }
@@ -644,6 +629,21 @@ impl AnalysisState {
             session.as_ref().map(f)
         })?;
         Some(session)
+    }
+
+    /// Move the editing clock back. The quiet period before a whole-program read is wall time, and a test that
+    /// waited it out would be waiting on a clock the virtual executor does not advance.
+    #[cfg(test)]
+    pub fn pretend_a_pause(&self, for_how_long: Duration) -> bool {
+        let mut slot = self
+            .inner
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let Some(session) = slot.as_mut() else {
+            return false;
+        };
+        session.pretend_a_pause(for_how_long);
+        true
     }
 
     /// Logical parallelism used by the analysis blocking pool.
@@ -672,24 +672,18 @@ impl AnalysisState {
         config_file: Option<PathBuf>,
     ) -> Option<Session<DiskFiles>> {
         let files = self.files.clone();
-        match tokio::task::spawn_blocking(move || {
-            let session =
-                Session::open_with_config_file(root, files, filter, config_file.as_deref());
-            let restored = session.load_the_sharing();
-            if restored > 0 {
-                log::info!("restored {restored} shared contribution(s) from the last run");
-            }
-            session
-        })
-        .await
-        {
-            Ok(session) => Some(session),
-            Err(error) if error.is_panic() => std::panic::resume_unwind(error.into_panic()),
-            Err(error) => {
-                log::error!("failed to construct a workspace session: {error}");
-                None
-            }
-        }
+        Some(
+            crate::rt::offload(move || {
+                let session =
+                    Session::open_with_config_file(root, files, filter, config_file.as_deref());
+                let restored = session.load_the_sharing();
+                if restored > 0 {
+                    log::info!("restored {restored} shared contribution(s) from the last run");
+                }
+                session
+            })
+            .await,
+        )
     }
 
     pub async fn install_session(&self, session: Session<DiskFiles>) {
@@ -732,7 +726,7 @@ impl AnalysisState {
         let gate = self.gate.clone().read_owned().await;
         let waited_for_the_gate = started.elapsed().as_millis() as u64;
 
-        let result = tokio::task::spawn_blocking(move || {
+        let (waited_for_the_session, ran, answer) = crate::rt::offload(move || {
             let _permit = permit;
             let locked = std::time::Instant::now();
             let session = inner
@@ -767,26 +761,16 @@ impl AnalysisState {
         })
         .await;
 
-        match result {
-            Ok((waited_for_the_session, ran, answer)) => {
-                let took = started.elapsed().as_millis() as u64;
-                if took > QUERY_BUDGET.as_millis() as u64 {
-                    log::debug!(
-                        "a query took {took} ms — permit {waited_for_a_permit} ms, gate {gate} ms, session \
-                         {session} ms, ran {ran} ms",
-                        gate = waited_for_the_gate - waited_for_a_permit,
-                        session = waited_for_the_session,
-                    );
-                }
-                answer
-            }
-            Err(err) => {
-                if err.is_panic() {
-                    std::panic::resume_unwind(err.into_panic());
-                }
-                None
-            }
+        let took = started.elapsed().as_millis() as u64;
+        if took > QUERY_BUDGET.as_millis() as u64 {
+            log::debug!(
+                "a query took {took} ms — permit {waited_for_a_permit} ms, gate {gate} ms, session \
+                 {session} ms, ran {ran} ms",
+                gate = waited_for_the_gate - waited_for_a_permit,
+                session = waited_for_the_session,
+            );
         }
+        answer
     }
 
     pub async fn query_blocking<R, F>(&self, f: F) -> RequestOutcome<R>
@@ -1029,18 +1013,15 @@ impl AnalysisState {
     }
 }
 
-/// Run `f` where blocking is allowed: on the server's multi-threaded runtime the thread hands its other tasks on
-/// (`block_in_place`), and anywhere else — a test's current-thread runtime — it is called directly, because
-/// `block_in_place` panics there.
 fn blocking<R>(f: impl FnOnce() -> R) -> R {
+    #[cfg(not(target_arch = "wasm32"))]
     if tokio::runtime::Handle::try_current()
         .map(|handle| handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread)
         .unwrap_or(false)
     {
-        tokio::task::block_in_place(f)
-    } else {
-        f()
+        return tokio::task::block_in_place(f);
     }
+    f()
 }
 
 impl Default for AnalysisState {

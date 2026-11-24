@@ -1212,9 +1212,11 @@ impl<F: FileProvider + Clone> Session<F> {
         // but the store's caches, which are read-mostly; measured on neovim's `ui.c`, 460 records took **17.08 s** of
         // one core while the program read's own six seconds of cook-and-parse had nothing to do with it. The count is
         // the machine's cores, and the chunks are cut to keep the answers in the caller's order.
+        // wasm reports no parallelism. Treating that as four cores would enter `thread::scope` on a runtime that
+        // cannot start a thread.
         let threads = std::thread::available_parallelism()
             .map(|cores| cores.get())
-            .unwrap_or(4)
+            .unwrap_or(if cfg!(target_arch = "wasm32") { 1 } else { 4 })
             .min(files.len().max(1));
         if threads <= 1 || files.len() < 16 {
             return files.iter().filter_map(prepare).collect();
@@ -1436,8 +1438,9 @@ impl<F: FileProvider + Clone> Session<F> {
     /// **Move the editing clock back**, so that a test can ask about a schedule that waits ten seconds without
     /// sleeping for them — the two thresholds in this file are a person's typing rhythm, and a test that waited for
     /// the longer one would be a test nobody runs.
-    #[cfg(test)]
-    pub(crate) fn pretend_a_pause(&mut self, for_how_long: std::time::Duration) {
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn pretend_a_pause(&mut self, for_how_long: std::time::Duration) {
         self.last_edit = std::time::Instant::now()
             .checked_sub(for_how_long)
             .unwrap_or_else(std::time::Instant::now);
@@ -1472,7 +1475,10 @@ impl<F: FileProvider + Clone> Session<F> {
     }
 
     /// The root a program read would be for, ignoring the clock — see [`Session::the_program_to_read`].
-    pub(crate) fn the_next_unit_to_read(&self) -> Option<PathBuf> {
+    ///
+    /// Public because the pump is the caller that already decided the quiet period has elapsed: it yields, an edit
+    /// may land, and the read that follows has to see that edit rather than ask the clock again and postpone.
+    pub fn the_next_unit_to_read(&self) -> Option<PathBuf> {
         // **The module interface units first, then the open documents.** A module is a *dependency* of the files that
         // import it: until `bits/std.cc` has been read as a translation unit, every header in its closure answers from
         // its raw summary, and an `import std;` file's completions are wrong for as long as that lasts. They are

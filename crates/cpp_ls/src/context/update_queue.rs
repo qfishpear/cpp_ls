@@ -298,7 +298,7 @@ impl UpdateInbox {
 
     /// Wait until there is something to apply, or `timeout` passes.
     pub async fn wait_for_work(&self, timeout: Duration) -> bool {
-        tokio::time::timeout(timeout, self.work.notified())
+        crate::rt::timeout(timeout, self.work.notified())
             .await
             .is_ok()
     }
@@ -407,7 +407,7 @@ async fn process(snapshot: &ServerContextSnapshot, event: UpdateEvent) {
 /// It exists for the requests that never come: an edit with no completion after it still has to reach the analysis
 /// (diagnostics are published from it, and the index pump is woken by it).
 pub fn spawn_update_queue(inner: Arc<ServerContextInner>) {
-    tokio::spawn(async move {
+    crate::rt::spawn(async move {
         let snapshot = ServerContextSnapshot::new(inner);
 
         loop {

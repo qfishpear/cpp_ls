@@ -232,6 +232,8 @@ installed. Its output is idiomatic, not byte-identical to clang-format's.
   feature, with the diagnostic registry and each rule's severity
 - [`docs/c-support.md`](docs/c-support.md) — the same for C, including the twenty-one rules that can fire there
 - [`docs/configuration.md`](docs/configuration.md) — `.cppls.toml`, the compilation database, include paths, standards
+- [`docs/browser-host.md`](docs/browser-host.md) — running this wasm build in a browser worker
+- [`docs/open-questions.md`](docs/open-questions.md) — what is measured and **not** fixed, with the evidence
 
 ## License
 
