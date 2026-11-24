@@ -71,7 +71,9 @@ const COMMIT_A_SLICE: usize = 4;
 /// ```
 ///
 /// Sixteen is the middle: it spreads the decode over the cores without making one insert a stall a request can feel.
-const COOK_A_SLICE: usize = 16;
+/// The wasm reactor cooks the slice on the same turn that serves requests, and one core cannot overlap them.
+/// Two files keep a turn under the pause a keystroke can feel; the native pool still takes sixteen.
+const COOK_A_SLICE: usize = if cfg!(target_arch = "wasm32") { 2 } else { 16 };
 
 /// Feedback target for adjusting wave size, not a hard end-to-end latency deadline.
 const INDEX_SLICE_MS: u64 = 30;

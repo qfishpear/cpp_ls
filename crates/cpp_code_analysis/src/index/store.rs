@@ -677,7 +677,14 @@ impl<F: FileProvider> SummaryStore<F> {
     }
 
     /// **The summary database, opened on first use and used always** — see [`SummaryStore::database`].
+    ///
+    /// The wasm reactor has no durable disk: its filesystem is the page's memory and dies with the worker, and
+    /// `wasm32` stores records uncompressed. Opening the database there spends the program read's record pass
+    /// (seconds of fingerprinting, and a hundred-megabyte file) on a cache the next refresh cannot open.
     fn summary_database(&self) -> Option<std::sync::Arc<cache::cache_db::SummaryCache>> {
+        if cfg!(target_arch = "wasm32") {
+            return None;
+        }
         self.summary_database
             .get_or_init(|| {
                 cache::cache_db::shared_named(
@@ -1969,6 +1976,10 @@ impl<F: FileProvider> SummaryStore<F> {
         reading: &CookedFile,
         rendered: &crate::preprocess::cooked::RenderedCooked,
     ) {
+        // The fingerprint walks the file's closure. With no database it is computed and discarded.
+        let Some(database) = self.summary_database() else {
+            return;
+        };
         let Some(source) = self.files.read(path) else {
             return;
         };
@@ -1979,9 +1990,6 @@ impl<F: FileProvider> SummaryStore<F> {
             content: content_hash(&source),
             config: self.context_hash(path),
             env: fingerprint,
-        };
-        let Some(database) = self.summary_database() else {
-            return;
         };
         let bytes = crate::summary_codec::encode_the_cooked_record(reading, Some(rendered));
         database.put_cooked_reading(key, &bytes);
@@ -2005,6 +2013,7 @@ impl<F: FileProvider> SummaryStore<F> {
         &self,
         path: &Path,
     ) -> Result<(CookedFile, crate::preprocess::cooked::RenderedCooked), &'static str> {
+        let database = self.summary_database().ok_or("no database")?;
         let source = self.files.read(path).ok_or("no text")?;
         let fingerprint = self.the_record_environment(path).ok_or("no closure")?;
         let key = CacheKey {
@@ -2012,7 +2021,6 @@ impl<F: FileProvider> SummaryStore<F> {
             config: self.context_hash(path),
             env: fingerprint,
         };
-        let database = self.summary_database().ok_or("no database")?;
         let bytes = database.cooked_reading(key).ok_or("not stored")?;
         let (cooked, rendered) =
             crate::summary_codec::decode_the_cooked_record(&bytes).map_err(|_| "undecodable")?;
@@ -2031,6 +2039,7 @@ impl<F: FileProvider> SummaryStore<F> {
         path: &Path,
         reading: &CookedFile,
     ) -> Option<(CacheKey, Vec<u8>)> {
+        let database = self.summary_database()?;
         let source = self.files.read(path)?;
         let fingerprint = self.the_record_environment(path)?;
         let key = CacheKey {
@@ -2038,7 +2047,6 @@ impl<F: FileProvider> SummaryStore<F> {
             config: self.context_hash(path),
             env: fingerprint,
         };
-        let database = self.summary_database()?;
         // **A record with a rendering is not replaced by one without.** Both write the same key, and the program read
         // — which has no per-file spans to keep — runs *after* the cooks that do. Without this, every full record was
         // overwritten by a facts-only one, and the next session's hit answered `no rendering` for all of them
@@ -2079,6 +2087,7 @@ impl<F: FileProvider> SummaryStore<F> {
     /// miss rather than a wrong answer. `resolution_still_holds` is asked as well, because a record's paths were
     /// resolved against a filesystem that may have moved under it.
     pub fn the_stored_cooked_reading(&self, path: &Path) -> Option<CookedFile> {
+        let database = self.summary_database()?;
         let source = self.files.read(path)?;
         let fingerprint = self.the_record_environment(path)?;
         let key = CacheKey {
@@ -2086,7 +2095,6 @@ impl<F: FileProvider> SummaryStore<F> {
             config: self.context_hash(path),
             env: fingerprint,
         };
-        let database = self.summary_database()?;
         let bytes = database.cooked_reading(key)?;
         crate::summary_codec::decode_the_cooked_reading(&bytes).ok()
     }

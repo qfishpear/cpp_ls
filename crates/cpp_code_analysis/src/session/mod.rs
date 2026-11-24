@@ -803,8 +803,9 @@ pub struct Session<F: FileProvider = DiskFiles> {
     definitions: std::sync::Mutex<crate::MacroDefinitions>,
     /// **The project's translation units that have been read as programs** — see [Session::read_the_unit].
     ///
-    /// Cleared wherever [Session::units] is: a unit read is a reading of the same timeline, so anything that
-    /// moves inside it makes this list a claim about a reading that no longer describes its closure.
+    /// Cleared when a file's directive **text** changes ([`DirectivesMoved::environment`]). An edit that only
+    /// shifts later directives down the file changes their offsets (`layout`) and drops the in-memory timeline,
+    /// but the program's includes, macros and conditions are the same, so the program is not read again.
     units_read: std::collections::HashSet<String>,
     /// **Translation units the session has been told to read as programs** that are not open documents — the module
     /// interface units, in practice.

@@ -700,3 +700,32 @@ pub(crate) fn a_cook_writes_its_rendering_to_the_disk() {
         "the rendering the cook wrote survives a facts-only write"
     );
 }
+
+/// Typing above a trailing `#ifdef` shifts that directive's byte offset (`layout`) without changing the
+/// directive text (`environment`). The program was already read; it stays read. Editing the directive
+/// itself is a different program.
+#[test]
+pub(crate) fn typing_above_a_trailing_directive_keeps_the_program_read() {
+    let source = "int main(){return 0;}\n#ifdef LOCAL\nint debug;\n#endif\n";
+    let files = MemoryFiles::new().with_file("/p/main.cpp", source);
+    let fixture = Memory::new("trailing-directive-offset", &files);
+    let mut session = fixture.session();
+    session.did_open("/p/main.cpp", source);
+
+    let root = crate::session::queue_key(Path::new("/p/main.cpp"));
+    session.units_read.insert(root.clone());
+
+    let typed = source.replacen("return 0;", "return 1;", 1);
+    session.did_change("/p/main.cpp", &typed);
+    assert!(
+        session.units_read.contains(&root),
+        "a body edit that only shifts a later directive does not unread the program"
+    );
+
+    let directive = typed.replace("#ifdef LOCAL", "#ifdef DEBUG");
+    session.did_change("/p/main.cpp", &directive);
+    assert!(
+        !session.units_read.contains(&root),
+        "editing the directive text unreads the program"
+    );
+}

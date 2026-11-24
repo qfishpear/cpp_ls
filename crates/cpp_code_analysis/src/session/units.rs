@@ -1204,6 +1204,11 @@ impl<F: FileProvider + Clone> Session<F> {
         &self,
         prepared: &PreparedUnitReading,
     ) -> Vec<(crate::cache::cache_db::CacheKey, Vec<u8>)> {
+        // Each record's key fingerprints that file's closure. The wasm reactor has no database, so the
+        // fingerprints would be built and dropped — about three seconds on `<bits/stdc++.h>`.
+        if self.store.database().is_none() {
+            return Vec::new();
+        }
         let files = &prepared.indexed.files;
         let prepare = |(path, cooked): &(std::path::PathBuf, crate::CookedFile)| {
             self.store.prepare_a_cooked_record(path, cooked)

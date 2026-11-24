@@ -485,6 +485,11 @@ impl<F: FileProvider + Clone> Session<F> {
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .clear();
+            }
+            // Offset-only movement drops the timelines above. The program itself is read again only when the
+            // directives' text changed: a body edit above a trailing `#ifdef` shifts every later offset and used
+            // to clear `units_read` with them.
+            if moved.environment {
                 self.units_read.clear();
             }
         }
@@ -600,15 +605,15 @@ impl<F: FileProvider + Clone> Session<F> {
         // refuses itself the moment anything it was built from moves (`crate::tu_cache`).
         if moved.layout {
             self.held_units().remove(&queue_key(path));
-            // **And the program this file is in, for the same reason and no other.** A body edit changes the file's own
-            // text, but not the program's *shape*: the closure's directives, includes and conditions are where they
-            // were, so the facts a program read filed for every **other** file of the closure are still true — and the
-            // edited file's own facts are rebuilt by the per-file cook (`Session::want_the_closure_cooked`). Re-reading
-            // the program after every pause in typing would be **5.24 s of background CPU for an answer that did not
-            // change** (measured: 180 files, 806 008 tokens, `tests/keystroke_probe.rs`).
-            //
-            // A *directive* edit is the other case: every offset the timeline recorded moved, and the rendering of the
-            // whole program changes with it, so this file's program is read again at the next quiet moment.
+        }
+        // **The program is read again only when the directives' text changed.** `layout` also folds each
+        // directive's byte offset, so typing above a trailing `#ifdef` used to look like a directive edit and
+        // schedule another whole-program read (measured at 3.8–5 s in the browser, almost all of it the same
+        // cook the previous read had already done). The edited file's own facts are rebuilt by the per-file cook
+        // (`Session::want_the_closure_cooked`); the other files of the closure still describe the same includes,
+        // macros and conditions. A real directive edit changes `environment`, and that is this file's program
+        // being read again at the next quiet moment.
+        if moved.environment {
             self.units_read.remove(&queue_key(path));
         }
         // **The one place a refusal is cleared**, and it is cleared because the reason for it — the text — has
