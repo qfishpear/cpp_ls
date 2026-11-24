@@ -44,6 +44,75 @@ fn a_member_named_like_its_class_does_not_hide_the_class() {
     );
 }
 
+/// **A bare `sort` is a function when `<algorithm>` and `list::sort` are both visible.**
+///
+/// `std::sort` is a function template and `list::sort()` is a member. The highlighter asks the bare spelling. The
+/// member is a class member, so it is not an answer to that spelling; the namespace declarations are, and they are
+/// one colour even when their scopes or template heads do not match.
+#[test]
+fn a_bare_name_in_a_namespace_is_a_function_beside_a_member() {
+    let index = index(&[
+        (
+            "/p/algo.h",
+            "namespace std {\n template<typename It> void sort(It first, It last);\n template<typename It, typename Cmp> void sort(It first, It last, Cmp cmp);\n}\n",
+        ),
+        (
+            "/p/list.h",
+            "namespace std {\n class list { public: void sort(); template<typename Cmp> void sort(Cmp cmp); };\n}\n",
+        ),
+        (
+            "/p/main.cpp",
+            "#include \"algo.h\"\n#include \"list.h\"\nvoid f(int* begin, int* end) { std::sort(begin, end); }\n",
+        ),
+    ]);
+
+    let found = index.kind_of("sort", Path::new("/p/main.cpp"));
+    let Known::Yes(kind) = found else {
+        panic!("a bare sort must be a function, not {found:?}");
+    };
+    assert_eq!(kind.kind, crate::DeclKind::Function);
+    assert!(!kind.constructor);
+}
+
+/// **`vector<int>` and `vector<bool>` are one type** for a colour, constructors included in the headers or not.
+#[test]
+fn a_bare_class_template_is_a_type_beside_its_specialization() {
+    let index = index(&[
+        (
+            "/p/vector.h",
+            "namespace std {\n template<typename T> class vector { public: vector(); void clear(); };\n template<> class vector<bool> { public: void flip(); };\n}\n",
+        ),
+        (
+            "/p/main.cpp",
+            "#include \"vector.h\"\nvoid f() { std::vector<int> values; values.clear(); }\n",
+        ),
+    ]);
+
+    let found = index.kind_of("vector", Path::new("/p/main.cpp"));
+    let Known::Yes(kind) = found else {
+        panic!("vector must be a type, not {found:?}");
+    };
+    assert_eq!(kind.kind, crate::DeclKind::Type);
+}
+
+/// **A class that declares constructors is still that class** when the highlighter asks the bare name.
+#[test]
+fn a_class_with_constructors_is_still_a_type() {
+    let index = index(&[
+        (
+            "/p/range.h",
+            "class TextRange { public: TextRange(); TextRange(int n); };\n",
+        ),
+        ("/p/main.cpp", "#include \"range.h\"\nTextRange range;\n"),
+    ]);
+
+    let found = index.kind_of("TextRange", Path::new("/p/main.cpp"));
+    let Known::Yes(kind) = found else {
+        panic!("the class must keep its colour beside its constructors: {found:?}");
+    };
+    assert_eq!(kind.kind, crate::DeclKind::Type);
+}
+
 fn index(files: &[(&str, &str)]) -> ProjectIndex {
     let mut index = ProjectIndex::new();
 

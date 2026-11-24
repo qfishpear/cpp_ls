@@ -182,26 +182,23 @@ pub async fn on_goto_definition_handler(
         // and a list whose entries are "the definition, a promise that one exists, another definition" makes the
         // promise look like a place. What is kept per group — one file, one scope, one name — is the definitions when
         // a group has any, and everything when it has none (a declaration is a better answer than no answer).
-        let found = definitions_where_there_are_bodies(session, found);
+        let mut found = definitions_where_there_are_bodies(session, found);
 
-        // **The overload a call means comes first.** The protocol allows a list and a client shows it in order, so the
-        // first entry is what a reader who does not pick from the popup gets — and for a call that is the declaration
-        // its arguments select. The same two queries the hover marks from, so the two handlers cannot disagree.
-        let chosen = chosen_definition(session, &view, offset, &found);
+        // **The definition a call can reach comes first.** This editor opens the first location and does not show a
+        // peek list, so the order is the jump. A call the arguments do not narrow to one declaration still has a
+        // viable set — the same one the hover prints — and within it a body is the place a reader means, ahead of a
+        // forward declaration of that same signature.
+        put_the_definition_a_call_means_first(session, &view, offset, &mut found);
 
-        let mut ordered: Vec<(bool, Location)> = Vec::new();
-        for (at, declaration) in found.found.iter().enumerate() {
+        let mut locations: Vec<Location> = Vec::new();
+        for declaration in &found.found {
             let Some(uri) = path_to_uri(&declaration.file) else {
                 continue;
             };
             let range =
                 name_range(session, &declaration.file, &declaration.fact).unwrap_or_default();
-            ordered.push((Some(at) == chosen, Location { uri, range }));
+            locations.push(Location { uri, range });
         }
-        // Stable, so everything that is not the chosen one keeps the order the index answered in.
-        ordered.sort_by_key(|(is_the_one, _)| !*is_the_one);
-        let mut locations: Vec<Location> =
-            ordered.into_iter().map(|(_, location)| location).collect();
 
         match locations.len() {
             0 => None,
@@ -442,18 +439,20 @@ impl RegisterCapabilities for DefinitionCapabilities {
     }
 }
 
-/// **Which declaration a call at this offset means**, as an index into `found.found`.
+/// **Move the definition this call means to the front of `found`.**
 ///
-/// `None` for a name with one declaration, for a cursor that is not on a call, and for a call whose arguments select
-/// nothing — the three cases in which there is no first location to move forward.
-fn chosen_definition(
-    session: &Session<DiskFiles>,
+/// One decided declaration stays first, which is what a client that opens a single location needs. When several
+/// declarations can accept the arguments, the ones written with a body come before a forward declaration: `sort(a,
+/// a + n, cmp)` is the three-argument function in `stl_algo.h`, not `void sort(_RAIter, _RAIter);` in
+/// `algorithmfwd.h`. Everything the call cannot reach keeps its previous order, after those.
+fn put_the_definition_a_call_means_first<F: cpp_code_analysis::FileProvider + Clone>(
+    session: &Session<F>,
     view: &cpp_code_analysis::FileView,
     offset: cpp_code_analysis::file::coordinates::ReadingOffset,
-    found: &cpp_code_analysis::ProjectDefinitions,
-) -> Option<usize> {
+    found: &mut cpp_code_analysis::ProjectDefinitions,
+) {
     if found.found.len() < 2 {
-        return None;
+        return;
     }
     let parameter_lists: Vec<Option<String>> = found
         .found
@@ -475,7 +474,39 @@ fn chosen_definition(
                 .unwrap_or_default()
         })
         .collect();
-    session.the_declaration_a_call_means(view, offset, &parameter_lists, &template_parameters)
+    let viable = session
+        .the_declarations_a_call_means(view, offset, &parameter_lists, &template_parameters)
+        .unwrap_or_default();
+    // `then_some` evaluates its argument immediately. An empty set is a real answer — the call fits none of the
+    // declarations in view — and indexing it panics, which the worker resumes and dies on. Measured on a member
+    // call whose argument matches neither overload.
+    let chosen = (viable.len() == 1).then(|| viable[0]);
+    let body: Vec<bool> = found
+        .found
+        .iter()
+        .map(|declaration| {
+            is_written_as_a_definition(session, &declaration.file, &declaration.fact)
+        })
+        .collect();
+
+    let original = std::mem::take(&mut found.found);
+    let mut indexed: Vec<(usize, _)> = original.into_iter().enumerate().collect();
+    indexed.sort_by_key(|(at, _)| {
+        let rank = if chosen == Some(*at) {
+            0
+        } else if viable.contains(at) && body[*at] {
+            1
+        } else if viable.contains(at) {
+            2
+        } else {
+            3
+        };
+        (rank, *at)
+    });
+    found.found = indexed
+        .into_iter()
+        .map(|(_, declaration)| declaration)
+        .collect();
 }
 
 #[cfg(test)]
@@ -603,6 +634,142 @@ class Promised;
                 .len(),
             1,
             "a declaration with nothing to prefer stays"
+        );
+    }
+
+    /// **A call jumps to the overload that has a body**, not to a forward declaration of a different arity.
+    ///
+    /// `sort(a, a + n, cmp)` can reach the three-argument template. That name is also forward-declared with two
+    /// arguments, and the index answers with the forward declaration first. The editor opens whichever location is
+    /// first, so the definition written with a body has to be that one.
+    #[test]
+    fn a_call_prefers_the_definition_that_accepts_its_arguments() {
+        let header = "\
+template<class It>
+void sort(It, It);
+template<class It, class Cmp>
+void sort(It, It, Cmp);
+template<class It, class Cmp>
+void sort(It first, It last, Cmp cmp) { (void)first; (void)last; (void)cmp; }
+";
+        let source = "\
+#include \"sort.h\"
+bool cmp(int, int);
+int main() {
+    int a[2];
+    sort(a, a + 2, cmp);
+}
+";
+        let memory = MemoryFiles::new()
+            .with_file("/p/sort.h", header)
+            .with_file("/p/main.cpp", source)
+            .with_file("/p/other.cpp", "int main() { return 0; }\n");
+        let providers = SessionFiles::new(OpenDocuments::new(), memory);
+        let mut session = Session::with_config(
+            "/p",
+            providers,
+            WatchFilter::new("/p"),
+            CompilerConfig::default(),
+        );
+        session.add_project_files([
+            std::path::PathBuf::from("/p/sort.h"),
+            std::path::PathBuf::from("/p/main.cpp"),
+        ]);
+        session.index_everything();
+        session.load("/p/main.cpp");
+
+        let view = session
+            .view_of_the_file(std::path::Path::new("/p/main.cpp"))
+            .expect("the written text");
+        let at = source.find("sort(a, a + 2, cmp)").expect("the call");
+        let offset = cpp_code_analysis::file::coordinates::ReadingOffset::new(at);
+        let Known::Yes(mut found) = session.definitions(&view, offset) else {
+            panic!("sort is declared");
+        };
+        put_the_definition_a_call_means_first(&session, &view, offset, &mut found);
+        let text = session.text(&found.found[0].file).expect("held");
+        let declaration = &found.found[0].fact;
+        let written =
+            &text[declaration.range.start_offset..declaration.range.end_offset().min(text.len())];
+        assert!(
+            written.contains("Cmp") && !written.trim_end().ends_with(';'),
+            "the first place is the three-argument definition, not a forward declaration: {written}"
+        );
+    }
+
+    /// **A call that fits no declaration still answers.**
+    ///
+    /// Ranking used to read the first viable index whenever it asked whether exactly one declaration was chosen.
+    /// That index does not exist when the call fits none of them, and the panic killed the language server.
+    /// Measured on a member call with two overloads and an argument neither accepts: the jump keeps both places,
+    /// in the order the index already had.
+    #[test]
+    fn a_call_that_fits_no_declaration_keeps_the_places() {
+        let source = "\
+struct Stream;
+struct Ios {
+    void tie();
+    void tie(Stream*);
+};
+void f(Ios& io) {
+    io.tie(0);
+}
+";
+        let memory = MemoryFiles::new()
+            .with_file("/p/main.cpp", source)
+            .with_file("/p/other.cpp", "int main() { return 0; }\n");
+        let providers = SessionFiles::new(OpenDocuments::new(), memory);
+        let mut session = Session::with_config(
+            "/p",
+            providers,
+            WatchFilter::new("/p"),
+            CompilerConfig::default(),
+        );
+        session.add_project_files([std::path::PathBuf::from("/p/main.cpp")]);
+        session.index_everything();
+        session.load("/p/main.cpp");
+
+        let view = session
+            .view_of_the_file(std::path::Path::new("/p/main.cpp"))
+            .expect("the written text");
+        let at = source.find("io.tie(0)").expect("the call") + "io.".len();
+        let offset = cpp_code_analysis::file::coordinates::ReadingOffset::new(at);
+        let Known::Yes(mut found) = session.definitions(&view, offset) else {
+            panic!("tie is declared");
+        };
+        assert!(
+            found.found.len() >= 2,
+            "both overloads are in view, which is what made the empty ranking index them"
+        );
+        let parameter_lists: Vec<Option<String>> = found
+            .found
+            .iter()
+            .map(|declaration| declaration.fact.parameter_list().map(str::to_string))
+            .collect();
+        let ranked = session.the_declarations_a_call_means(
+            &view,
+            offset,
+            &parameter_lists,
+            &vec![Vec::new(); parameter_lists.len()],
+        );
+        assert!(
+            ranked.as_ref().is_none_or(|chosen| chosen.is_empty()),
+            "the fixture is a call that fits none of the declarations: {ranked:?}"
+        );
+        let before: Vec<_> = found
+            .found
+            .iter()
+            .map(|declaration| declaration.fact.parameter_list().map(str::to_string))
+            .collect();
+        put_the_definition_a_call_means_first(&session, &view, offset, &mut found);
+        let after: Vec<_> = found
+            .found
+            .iter()
+            .map(|declaration| declaration.fact.parameter_list().map(str::to_string))
+            .collect();
+        assert_eq!(
+            after, before,
+            "nothing the call can reach, so the order stays"
         );
     }
 }

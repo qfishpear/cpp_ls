@@ -1273,3 +1273,52 @@ pub(crate) fn the_real_adaptor_shape_deduces_the_closure() {
         typed.type_of
     );
 }
+
+/// **`ios::sync` names the base's static member, through the typedef.**
+///
+/// `using namespace std` makes the qualifier the bare `ios`, and `ios` is `typedef basic_ios<char> ios` — a type,
+/// not a class scope. The member is declared on the base. A jump that only accepts a class whose qualified name is
+/// exactly `ios` answers nothing, which is what `ios::sync_with_stdio` did.
+#[test]
+pub(crate) fn a_typedef_in_a_namespace_names_its_base_member() {
+    let text = "namespace std {\n\
+                class Base { public: static bool sync(bool on = true); };\n\
+                class Derived : public Base {};\n\
+                typedef Derived ios;\n\
+                }\n\
+                using namespace std;\n\
+                int main() { ios::sync(false); }\n";
+    let files = MemoryFiles::new().with_file("/p/a.cpp", text);
+    let fixture = Memory::new("a-typedef-names-a-base-member", &files);
+    let mut session = fixture.session();
+    session.did_open("/p/a.cpp", text);
+    session.index_everything();
+    let path = std::path::PathBuf::from("/p/a.cpp");
+    let view = session.view_of_the_file(&path).expect("a view");
+
+    let at = text.find("ios::sync").expect("the fixture") + "ios::".len();
+    let found = session.definitions(&view, crate::file::coordinates::ReadingOffset::new(at));
+    let Known::Yes(found) = found else {
+        panic!("`ios::sync` must reach the member: {found:?}");
+    };
+    assert!(
+        found.found.iter().any(|declaration| {
+            declaration.fact.name == "sync"
+                && declaration
+                    .fact
+                    .scope
+                    .as_deref()
+                    .is_some_and(|scope| scope.ends_with("Base"))
+        }),
+        "the member is Base::sync, not a miss and not Derived: {found:?}"
+    );
+
+    // The jump and the colour are one question. A token with no classification is drawn as a plain identifier.
+    let coloured = session.classified_names(&view).into_iter().any(|name| {
+        name.range.start_offset == at && name.kind == crate::semantic::NameKind::Method
+    });
+    assert!(
+        coloured,
+        "`ios::sync` is a method, not an unclassified identifier"
+    );
+}

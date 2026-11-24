@@ -465,7 +465,12 @@ pub fn definitions_across_files(
                 // member list was built from — while the index holds all six (four more in `<print>`, under `#ifdef
                 // __cpp_lib_print`). Without this guard the branch answers before the name lookup (the fallthrough
                 // below) is ever asked, which is why the visibility walk never even ran for this name.
-                && index.scope_names_a_class(qualifier, path)
+                // A typedef is a type and not a class scope: `ios` is `typedef basic_ios<char> ios`, so its
+                // qualified name is `std::ios` and [`ProjectIndex::scope_names_a_class`] says no. The member
+                // still lives on the class the alias names. A namespace fails both checks, which keeps
+                // `std::cout` on the ordinary lookup below.
+                && (index.scope_names_a_class(qualifier, path)
+                    || index.names_a_type(qualifier, path))
                 && let Known::Yes(list) = members_of(index, scopes, root, path, qualifier)
             {
                 let inherited: Vec<ProjectDefinition> = list
