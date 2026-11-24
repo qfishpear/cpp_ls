@@ -1767,6 +1767,39 @@ pub struct PreparedUnitReading {
     walked: Vec<PathBuf>,
 }
 
+impl PreparedUnitReading {
+    /// A reading produced on another instance. The revision is the parent's: the worker that cooked the
+    /// program has its own session, and [`Session::commit_a_unit_reading`] has to drop a result the parent's
+    /// documents have since moved on from.
+    pub fn from_remote(
+        root: PathBuf,
+        revision: SessionRevision,
+        program: u64,
+        indexed: crate::IndexedUnit,
+        walked: Vec<PathBuf>,
+    ) -> Self {
+        Self {
+            root,
+            revision,
+            program,
+            indexed,
+            walked,
+        }
+    }
+
+    pub fn program_hash(&self) -> u64 {
+        self.program
+    }
+
+    pub fn walked_paths(&self) -> &[PathBuf] {
+        &self.walked
+    }
+
+    pub fn into_indexed(self) -> crate::IndexedUnit {
+        self.indexed
+    }
+}
+
 /// **What a program read needs, gathered under the session lock and read without it.**
 ///
 /// The three parts of a unit read, and the measurement that decides where each one is paid
@@ -1817,6 +1850,21 @@ impl<F: FileProvider> UnitReadMaterials<F> {
     /// The root this program is read for, by the index's spelling.
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// The session generation this gather observed.
+    pub fn revision(&self) -> SessionRevision {
+        self.revision.clone()
+    }
+
+    /// The root's text, when the walk copied it. A served rendering has none: the text is an open document then.
+    pub fn root_text(&self) -> Option<String> {
+        self.sources.get(&self.root).cloned()
+    }
+
+    /// The facts were already in this session, so [`UnitReadMaterials::read_the_program`] only wraps them.
+    pub fn facts_are_known(&self) -> bool {
+        self.known.is_some() && self.program.is_some()
     }
 
     /// **The key the rendering is filed under** — what [`Session::prepare_a_unit_reading`] remembers per root.

@@ -10,6 +10,7 @@ mod context;
 pub mod handlers;
 mod logger;
 pub mod probes;
+mod program_job;
 mod rt;
 mod server;
 mod util;

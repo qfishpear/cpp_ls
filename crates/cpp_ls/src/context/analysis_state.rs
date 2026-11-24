@@ -479,9 +479,10 @@ impl AnalysisState {
             .await;
 
         // **The expensive half with no lock at all.** `spawn_blocking` rather than the analysis pool: this work is
-        // the background's, and it must not be one of the permits a request waits for.
+        // the background's, and it must not be one of the permits a request waits for. On the browser reactor the
+        // same call would run inside this poll, so a cold program goes to the other instance instead.
         let prepared = match materials {
-            Some(materials) => crate::rt::offload(move || materials.read_the_program()).await,
+            Some(materials) => self.read_the_program_off_the_lock(materials).await,
             None => None,
         };
         let gathered = started.elapsed() - choosing;
@@ -562,6 +563,68 @@ impl AnalysisState {
             );
         }
         read.is_some()
+    }
+
+    /// Cook and parse away from the lock. Native code uses `spawn_blocking`. The browser reactor has no second
+    /// thread inside this instance, so a cold read is handed to the other one; a hit in the memo stays here, because
+    /// wrapping facts that are already known is not the work that was blocking the poll.
+    async fn read_the_program_off_the_lock(
+        &self,
+        materials: cpp_code_analysis::session::UnitReadMaterials<SessionFiles<DiskFiles>>,
+    ) -> Option<cpp_code_analysis::session::PreparedUnitReading> {
+        #[cfg(target_arch = "wasm32")]
+        {
+            return self.read_via_compute_or_inline(materials).await;
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            crate::rt::offload(move || materials.read_the_program()).await
+        }
+    }
+
+    /// Ask the compute instance, and read here when it declines or returns nothing.
+    ///
+    /// The host copies the request and returns before the cook starts, and this task stays pending so the poll can
+    /// end. A completion that arrives meanwhile is a `cpp_ls_send` on this instance. The result is committed only if
+    /// `revision` is still current, which is the check [`Session::commit_a_unit_reading`] already makes.
+    #[cfg(target_arch = "wasm32")]
+    async fn read_via_compute_or_inline(
+        &self,
+        materials: cpp_code_analysis::session::UnitReadMaterials<SessionFiles<DiskFiles>>,
+    ) -> Option<cpp_code_analysis::session::PreparedUnitReading> {
+        if !materials.facts_are_known() {
+            let root = materials.root().to_path_buf();
+            let revision = materials.revision();
+            let root_text = materials.root_text();
+            let job = self.with_snapshot(|session| {
+                crate::program_job::encode_request(&root, root_text.as_deref(), session.documents())
+            });
+            if let Some(job) = job
+                && let Some(pending) = crate::program_job::try_submit(job)
+            {
+                drop(materials);
+                let bytes = pending.await;
+                if !bytes.is_empty()
+                    && let Some(reading) =
+                        crate::program_job::decode_reading(&root, revision, &bytes)
+                {
+                    return Some(reading);
+                }
+                let again = self
+                    .run_blocking("gather a unit read", {
+                        let root = root.clone();
+                        move |session| session.gather_a_unit_read(&root)
+                    })
+                    .await;
+                return match again {
+                    Some(materials) => {
+                        crate::rt::offload(move || materials.read_the_program()).await
+                    }
+                    None => None,
+                };
+            }
+        }
+        crate::rt::offload(move || materials.read_the_program()).await
     }
 
     /// Wait for a wake-up, or for `timeout` to pass.
